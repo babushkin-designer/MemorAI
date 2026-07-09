@@ -41,6 +41,22 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 - Historical note: 007 was built on 003's branch, 008/009/010 formed a
   stacked CLI chain on 004's branch to avoid conflicts in `memorai`.
 - Local fork: nothing is ever pushed to a remote.
+- 2026-07-09 post-merge follow-ups (owner authorized direct work):
+  - 008 field bug found & fixed (`89bd57c`): `defaults read` exits 1 when
+    `outputPath` is unset, killing retention.sh under `set -e`. The plan's
+    fixture always set `MEMORAI_DIR`, so the gap escaped both executor and
+    reviewer — fixtures must also cover the "no override" path.
+  - 008's LaunchAgent approach is a dead end on this macOS: TCC denies
+    /bin/bash-under-launchd access to ~/Downloads ("Operation not
+    permitted"). Superseded by in-app daily retention
+    (`AutoRec/RetentionManager.swift`, `d6111ec`); the owner's LaunchAgent
+    was uninstalled. `memorai retention run` remains for manual passes.
+  - Screen Memory re-enabled (was off due to Vision OCR being broken on the
+    macOS beta); RapidOCR pipeline verified live end-to-end: sidecar ready,
+    JPEG fallback saving (HEIF encode unavailable on this system), OCR text
+    landing in index.jsonl.
+  - App rebuilt and redeployed to /Applications twice (post-merge, then
+    post-RetentionManager); recordings checked inactive before each restart.
 
 ## Full findings table (audit of 2026-07-09, standard depth)
 
