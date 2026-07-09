@@ -49,6 +49,9 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
 ./memorai screenshots [date]  # list captures for a day
 ./memorai clipboard [count]   # show clipboard history
 ./memorai ocr [date] [count]  # show OCR text from screenshots
+./memorai search <query> [--days N] [--source screen|clipboard|calls|all] [--regex] [--limit N]
+                               # search OCR text, clipboard history, and call transcripts
+                               # e.g. ./memorai search "kickoff" --days 14 --source screen
 ./memorai set <key> <value>   # change settings
 ./memorai exclude add|remove|list  # manage excluded apps
 ./memorai start|stop|restart  # control the app

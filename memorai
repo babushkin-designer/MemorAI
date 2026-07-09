@@ -288,6 +288,165 @@ cmd_restart() {
     cmd_start
 }
 
+cmd_search() {
+    local query="$1"; shift
+    if [ -z "$query" ]; then
+        echo "Usage: memorai search <query> [--days N] [--source screen|clipboard|calls|all] [--regex] [--limit N]" >&2
+        return 1
+    fi
+    local days=7 source=all regex=0 limit=50
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --days)   days="$2"; shift 2 ;;
+            --source) source="$2"; shift 2 ;;
+            --regex)  regex=1; shift ;;
+            --limit)  limit="$2"; shift 2 ;;
+            *) echo "Unknown flag: $1" >&2; return 1 ;;
+        esac
+    done
+    local output
+    output=$(get_output_path)
+    local day_list="" i
+    for i in $(seq 0 $((days - 1))); do
+        day_list="$day_list $(date -v-${i}d +%Y-%m-%d)"
+    done
+    MEMORAI_QUERY="$query" MEMORAI_REGEX="$regex" MEMORAI_LIMIT="$limit" \
+    MEMORAI_SOURCE="$source" MEMORAI_OUTPUT="$output" MEMORAI_DAYS="$day_list" \
+    python3 << 'PYEOF'
+import json, os, re, sys, glob
+
+query = os.environ.get("MEMORAI_QUERY", "")
+use_regex = os.environ.get("MEMORAI_REGEX") == "1"
+limit = int(os.environ.get("MEMORAI_LIMIT", "50"))
+source = os.environ.get("MEMORAI_SOURCE", "all")
+output = os.environ.get("MEMORAI_OUTPUT", "")
+days = set(os.environ.get("MEMORAI_DAYS", "").split())
+
+pattern = None
+if use_regex:
+    try:
+        pattern = re.compile(query, re.IGNORECASE)
+    except re.error as e:
+        print(f"invalid regex: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def find_match(text):
+    t = text.replace("\n", " ")
+    if use_regex:
+        m = pattern.search(t)
+        if m:
+            return m.start(), m.end(), t
+        return None
+    idx = t.lower().find(query.lower())
+    if idx >= 0:
+        return idx, idx + len(query), t
+    return None
+
+def context(s, e, t, width=60):
+    half = max(0, (width - (e - s)) // 2)
+    start = max(0, s - half)
+    end = min(len(t), start + width)
+    start = max(0, end - width)
+    return t[start:end].strip()
+
+hits = []  # (sort_key, display_line)
+
+def emit_day_records_py(screen_dir):
+    records = []
+    idx = os.path.join(screen_dir, "index.jsonl")
+    if os.path.exists(idx):
+        for line in open(idx, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    for f in glob.glob(os.path.join(screen_dir, "*.json")):
+        try:
+            records.append(json.load(open(f, encoding="utf-8")))
+        except Exception:
+            pass
+    return records
+
+if source in ("screen", "all"):
+    for day in days:
+        screen_dir = os.path.join(output, "screen", day)
+        if not os.path.isdir(screen_dir):
+            continue
+        for r in emit_day_records_py(screen_dir):
+            ts = r.get("timestamp", "")
+            app = r.get("app_name", "")
+            for field in ("ocr_text", "window_title", "url", "app_name"):
+                val = r.get(field)
+                if not val:
+                    continue
+                m = find_match(str(val))
+                if m:
+                    ctx = context(*m)
+                    hits.append((ts, f"{ts}  [screen]   {app} — {ctx}"))
+                    break
+
+if source in ("clipboard", "all"):
+    clip_file = os.path.join(output, "clipboard.jsonl")
+    if os.path.exists(clip_file):
+        for line in open(clip_file, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = r.get("timestamp", "")
+            if ts[:10] not in days:
+                continue
+            app = r.get("app_name", "")
+            for field in ("content", "app_name"):
+                val = r.get(field)
+                if not val:
+                    continue
+                m = find_match(str(val))
+                if m:
+                    ctx = context(*m)
+                    hits.append((ts, f"{ts}  [clip]     {app} — {ctx}"))
+                    break
+
+if source in ("calls", "all"):
+    for f in sorted(glob.glob(os.path.join(output, "call_*_transcript.txt"))):
+        base = os.path.basename(f)
+        m = re.match(r"call_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_transcript\.txt", base)
+        if not m:
+            continue
+        date_part, time_part = m.group(1), m.group(2)
+        if date_part not in days:
+            continue
+        ts = f"{date_part}T{time_part.replace('-', ':')}"
+        try:
+            lines = open(f, encoding="utf-8").readlines()
+        except Exception:
+            continue
+        for line in lines:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            mm = find_match(line)
+            if mm:
+                hits.append((ts, f"{date_part}            [call]     {base}: {line[:80]}"))
+
+hits.sort(key=lambda h: h[0], reverse=True)
+hits = hits[:limit]
+
+if not hits:
+    print("no matches")
+    sys.exit(0)
+
+for _, line in hits:
+    print(line)
+PYEOF
+}
+
 cmd_help() {
     cat << 'EOF'
 MemorAI — remembers everything you do on your computer
@@ -303,6 +462,10 @@ Commands:
   screenshots [date]        List today's screenshots (or given YYYY-MM-DD)
   clipboard [count]         Show clipboard history (default: last 20)
   ocr [date] [count]        Show OCR text from screenshots
+
+  search <query> [--days N] [--source screen|clipboard|calls|all] [--regex] [--limit N]
+    Search OCR text, clipboard history, and call transcripts.
+    Defaults: --days 7, --source all, substring match (case-insensitive), --limit 50
 
   set <key> <value>         Change a setting
     screen-memory true/false
@@ -327,6 +490,7 @@ case "${1:-help}" in
     screenshots)  cmd_screenshots "$2" ;;
     clipboard)    cmd_clipboard "$2" ;;
     ocr)          cmd_ocr "$2" "$3" ;;
+    search)       shift; cmd_search "$@" ;;
     set)          cmd_set "$2" "$3" ;;
     exclude)      cmd_exclude "$2" "$3" ;;
     help|--help|-h) cmd_help ;;
