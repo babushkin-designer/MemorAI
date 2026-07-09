@@ -6,8 +6,10 @@
 # ones are pruned.
 set -e
 RETENTION_DAYS="${RETENTION_DAYS:-14}"
-DIR="$HOME/Downloads/MemorAI/screen"
-LOG="$HOME/Downloads/MemorAI/memorai.log"
+DIR_BASE="${MEMORAI_DIR:-$(defaults read com.local.memorai outputPath 2>/dev/null)}"
+[ -z "$DIR_BASE" ] && DIR_BASE="$HOME/Downloads/MemorAI"
+DIR="$DIR_BASE/screen"
+LOG="$DIR_BASE/memorai.log"
 
 [ -d "$DIR" ] || exit 0
 
@@ -18,3 +20,13 @@ after=$(find "$DIR" -type f \( -name '*.jpg' -o -name '*.heif' -o -name '*.png' 
 find "$DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [retention] kept text, removed $((before - after)) images older than ${RETENTION_DAYS}d" >> "$LOG"
+
+# Cap the log: if it exceeds MAX_LOG_BYTES, keep only the last KEEP_BYTES.
+# Truncate via `cat >` (not `mv`) so the running app's open FileHandle keeps
+# pointing at the same inode.
+MAX_LOG_BYTES=$((10 * 1024 * 1024))
+KEEP_BYTES=$((5 * 1024 * 1024))
+if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG")" -gt "$MAX_LOG_BYTES" ]; then
+    tail -c "$KEEP_BYTES" "$LOG" > "$LOG.tmp" && cat "$LOG.tmp" > "$LOG" && rm -f "$LOG.tmp"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [retention] truncated memorai.log to last ${KEEP_BYTES} bytes" >> "$LOG"
+fi
