@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// OCR via a persistent RapidOCR (ONNX) Python sidecar.
 ///
@@ -19,8 +20,11 @@ class OCRProcessor {
     private var sidecar: Process?
     private var sidecarIn: FileHandle?
     private var sidecarOut: FileHandle?
-    private var sidecarFailed = false
     private var outBuffer = Data()
+    private var consecutiveFailures = 0
+    private var retryAfter: Date? = nil
+    private let maxConsecutiveFailures = 3
+    private let retryCooldown: TimeInterval = 600  // 10 min
 
     func process(imageURL: URL, jsonlURL: URL, baseMeta: [String: Any]) {
         queue.async {
@@ -57,7 +61,7 @@ class OCRProcessor {
             return nil
         }
 
-        guard let reply = readLine(from: stdout) else {
+        guard let reply = readLine(from: stdout, timeout: 30) else {
             log("[OCR] sidecar produced no reply — restarting")
             teardownSidecar()
             return nil
@@ -73,12 +77,12 @@ class OCRProcessor {
         if let stdin = sidecarIn, let stdout = sidecarOut, sidecar?.isRunning == true {
             return (stdin, stdout)
         }
-        if sidecarFailed { return nil }
+        if let after = retryAfter, Date() < after { return nil }
 
         guard let python = Self.pythonCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
               let script = Self.sidecarScriptPath() else {
             log("[OCR] no python interpreter or sidecar script found — OCR disabled")
-            sidecarFailed = true
+            recordSidecarFailure()
             return nil
         }
 
@@ -94,7 +98,7 @@ class OCRProcessor {
             try proc.run()
         } catch {
             log("[OCR] sidecar launch failed: \(error) — OCR disabled")
-            sidecarFailed = true
+            recordSidecarFailure()
             return nil
         }
 
@@ -103,20 +107,34 @@ class OCRProcessor {
         outBuffer.removeAll()
 
         // Wait for the readiness handshake (model load can take a few seconds).
-        guard let ready = readLine(from: stdout),
+        guard let ready = readLine(from: stdout, timeout: 60),
               let obj = try? JSONSerialization.jsonObject(with: ready) as? [String: Any],
               obj["ready"] as? Bool == true else {
             log("[OCR] sidecar did not report ready — OCR disabled")
             proc.terminate()
-            sidecarFailed = true
+            recordSidecarFailure()
             return nil
         }
 
         sidecar = proc
         sidecarIn = stdin
         sidecarOut = stdout
+        consecutiveFailures = 0
+        retryAfter = nil
         log("[OCR] RapidOCR sidecar ready (\(python))")
         return (stdin, stdout)
+    }
+
+    /// Records a sidecar launch/handshake failure. After
+    /// `maxConsecutiveFailures` in a row, backs off for `retryCooldown`
+    /// instead of retrying (and failing) on every tick.
+    private func recordSidecarFailure() {
+        consecutiveFailures += 1
+        if consecutiveFailures >= maxConsecutiveFailures {
+            retryAfter = Date().addingTimeInterval(retryCooldown)
+            consecutiveFailures = 0
+            log("[OCR] sidecar failed \(maxConsecutiveFailures)× — retrying in 10 min")
+        }
     }
 
     private func teardownSidecar() {
@@ -128,16 +146,24 @@ class OCRProcessor {
     }
 
     /// Blocking read of one newline-delimited line from a pipe, buffering any
-    /// surplus bytes for the next call.
-    private func readLine(from handle: FileHandle) -> Data? {
+    /// surplus bytes for the next call. Bounded by `timeout`; returns nil on
+    /// timeout, EOF, or poll error.
+    private func readLine(from handle: FileHandle, timeout: TimeInterval) -> Data? {
+        let deadline = Date().addingTimeInterval(timeout)
         while true {
             if let nl = outBuffer.firstIndex(of: 0x0A) {
                 let line = outBuffer.subdata(in: outBuffer.startIndex..<nl)
                 outBuffer.removeSubrange(outBuffer.startIndex...nl)
                 return line
             }
+            var pfd = pollfd(fd: handle.fileDescriptor, events: Int16(POLLIN), revents: 0)
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 { return nil }  // timeout
+            let rc = poll(&pfd, 1, Int32(min(remaining, 1.0) * 1000))
+            if rc < 0 { return nil }          // poll error
+            if rc == 0 { continue }           // interval elapsed, re-check deadline
             let chunk = handle.availableData
-            if chunk.isEmpty { return nil }  // EOF
+            if chunk.isEmpty { return nil }   // EOF
             outBuffer.append(chunk)
         }
     }
