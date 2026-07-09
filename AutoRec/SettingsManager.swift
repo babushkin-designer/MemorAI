@@ -90,6 +90,17 @@ class SettingsManager {
         set { defaults.set(newValue, forKey: "modelPath") }
     }
 
+    // MARK: - Dictation
+
+    /// System-wide voice dictation via ⌥Space (DictationManager).
+    var dictationEnabled: Bool {
+        get {
+            if defaults.object(forKey: "dictationEnabled") == nil { return true }
+            return defaults.bool(forKey: "dictationEnabled")
+        }
+        set { defaults.set(newValue, forKey: "dictationEnabled") }
+    }
+
     // MARK: - Helpers
 
     func ensureOutputDirectory() {

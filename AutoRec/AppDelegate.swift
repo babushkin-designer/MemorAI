@@ -6,11 +6,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var recordingManager: RecordingManager!
     private var callDetector: CallDetector!
     private var screenMemory: ScreenMemoryManager!
+    private var dictation: DictationManager!
     private let settings = SettingsManager.shared
     private var whisperAlertShown = false
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         screenMemory.stop()
+        dictation?.shutdown()
         let state = recordingManager?.state ?? .idle
         guard state == .recording || state == .starting || state == .paused || state == .stopping else {
             return .terminateNow
@@ -62,6 +64,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         recordingManager.onSystemAudioUnavailable = { [weak self] in
             self?.callDetector.reportSystemAudioUnavailable()
+        }
+
+        // --- Dictation (⌥Space) ---
+        dictation = DictationManager()
+        dictation.onStateChange = { [weak self] _ in
+            guard let self = self else { return }
+            self.updateStatusIcon(self.recordingManager?.state ?? .idle)
+        }
+        if settings.dictationEnabled {
+            dictation.enable()
         }
 
         callDetector = CallDetector()
@@ -185,6 +197,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let setupItem = NSMenuItem(title: "Whisper Setup…", action: #selector(openWhisperSetup), keyEquivalent: "")
         setupItem.target = self
         menu.addItem(setupItem)
+
+        // --- Dictation Section ---
+        menu.addItem(.separator())
+
+        let dictationTitle: String
+        switch dictation?.state ?? .idle {
+        case .listening: dictationTitle = "🎤 Dictation: listening… (⌥Space to stop)"
+        case .processing: dictationTitle = "📝 Dictation: transcribing…"
+        case .idle: dictationTitle = "Dictation (⌥Space)"
+        }
+        let dictationItem = addMenuItem(menu, dictationTitle, #selector(toggleDictation))
+        dictationItem.state = settings.dictationEnabled ? .on : .off
 
         // --- Screen Memory Section ---
         menu.addItem(.separator())
@@ -310,11 +334,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateStatusIcon(_ state: RecordingState) {
         if let button = statusItem.button {
             let color: NSColor
-            switch state {
-            case .recording: color = NSColor(red: 1.0, green: 0.1, blue: 0.1, alpha: 1.0)
-            case .paused: color = .systemOrange
-            case .starting, .stopping: color = .systemYellow
-            case .idle: color = .systemGray
+            switch dictation?.state ?? .idle {
+            case .listening: color = .systemBlue
+            case .processing: color = .systemPurple
+            case .idle:
+                switch state {
+                case .recording: color = NSColor(red: 1.0, green: 0.1, blue: 0.1, alpha: 1.0)
+                case .paused: color = .systemOrange
+                case .starting, .stopping: color = .systemYellow
+                case .idle: color = .systemGray
+                }
             }
             button.image = makeCircleIcon(color)
         }
@@ -347,6 +376,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openWhisperSetup() {
         WhisperSetupWindowController.shared.show()
+    }
+
+    @objc private func toggleDictation() {
+        settings.dictationEnabled.toggle()
+        if settings.dictationEnabled {
+            dictation.enable()
+        } else {
+            dictation.shutdown()
+        }
+        updateMenu()
     }
 
     // MARK: - Screen Memory Actions

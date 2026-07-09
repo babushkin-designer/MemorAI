@@ -1,7 +1,20 @@
 import Foundation
 
+/// One timestamped segment of a whisper transcription (offsets in ms from track start).
+struct TranscriptSegment {
+    let fromMs: Int
+    let toMs: Int
+    let text: String
+}
+
 /// Transcribes audio files using whisper-cli (whisper.cpp).
 /// Converts m4a → wav via ffmpeg, then runs whisper-cli.
+///
+/// When both mic and system tracks are usable, each track is transcribed
+/// separately and the segments are interleaved by timestamp into a
+/// speaker-labeled dialogue ("Я" = mic, "Собеседник" = system audio).
+/// Falls back to the old merged-mix mono transcription when only one track
+/// is usable or the dual-track path fails.
 class Transcriber {
     static let shared = Transcriber()
 
@@ -34,10 +47,11 @@ class Transcriber {
         let custom = SettingsManager.shared.modelPath
         if !custom.isEmpty { return custom }
         let fm = FileManager.default
-        let medium = (Self.defaultModelDir as NSString).appendingPathComponent("ggml-medium.bin")
-        let base = (Self.defaultModelDir as NSString).appendingPathComponent("ggml-base.bin")
-        if fm.fileExists(atPath: medium) { return medium }
-        return base
+        for name in ["ggml-large-v3-turbo.bin", "ggml-medium.bin"] {
+            let path = (Self.defaultModelDir as NSString).appendingPathComponent(name)
+            if fm.fileExists(atPath: path) { return path }
+        }
+        return (Self.defaultModelDir as NSString).appendingPathComponent("ggml-base.bin")
     }
 
     private let minTrackDuration: Double = 1.0
@@ -97,105 +111,30 @@ class Transcriber {
                 return
             }
 
-            let mergedWav = dir.appendingPathComponent(
-                baseName.replacingOccurrences(of: "_mic", with: "_merged")
-                        .replacingOccurrences(of: "_system", with: "_merged") + ".wav"
-            )
-
-            // Merge both tracks only when both are long enough. Otherwise use the usable single track
-            // to avoid diluting a good track with a broken one.
-            log("[Transcriber] Preparing audio (\(micOK && sysOK ? "merge mic+system" : (micOK ? "mic only" : "system only")))")
-            let convertResult: ProcessResult
-            if micOK && sysOK {
-                convertResult = runProcess(ffmpegPath, args: [
-                    "-y", "-nostats", "-loglevel", "error",
-                    "-i", micURL!.path,
-                    "-i", systemURL!.path,
-                    "-filter_complex",
-                    "[0:a]loudnorm=I=-16:TP=-1.5:LRA=11[mic];"
-                    + "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11[sys];"
-                    + "[mic][sys]amix=inputs=2:duration=longest[a]",
-                    "-map", "[a]",
-                    "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-                    mergedWav.path
-                ])
-            } else {
-                let sourceURL = micOK ? micURL! : systemURL!
-                convertResult = runProcess(ffmpegPath, args: [
-                    "-y", "-nostats", "-loglevel", "error", "-i", sourceURL.path,
-                    "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-                    mergedWav.path
-                ])
-            }
-
-            guard convertResult.exitCode == 0 else {
-                log("[Transcriber] ❌ ffmpeg merge failed (exit \(convertResult.exitCode)): \(convertResult.stderr.suffix(500))")
-                DispatchQueue.main.async { completion() }
-                return
-            }
-
-            // Get duration in seconds
-            let duration = trackDuration(mergedWav)
-            let chunkSec = 600.0 // 10 minutes per chunk
             let lang = SettingsManager.shared.whisperLanguage
             var fullTranscript = ""
 
-            if duration <= chunkSec * 1.5 {
-                log("[Transcriber] Transcribing merged audio (\(Int(duration))s, model: \((modelFile as NSString).lastPathComponent))...")
-                let tmpBase = dir.appendingPathComponent("_whisper_tmp")
-                let result = runProcess(whisperExec, args: [
-                    "-m", modelFile, "-l", lang,
-                    "-et", "2.2", "-lpt", "-0.5",
-                    "-otxt", "-of", tmpBase.path,
-                    mergedWav.path
-                ])
-                if result.exitCode == 0,
-                   let text = try? String(contentsOf: tmpBase.appendingPathExtension("txt"), encoding: .utf8) {
-                    fullTranscript = text
-                } else if result.exitCode != 0 {
-                    log("[Transcriber] ❌ Whisper failed (exit \(result.exitCode)): \(result.stderr.suffix(500))")
+            if micOK && sysOK {
+                log("[Transcriber] [\(sessionTag)] Dual-track transcription (speaker-labeled, model: \((modelFile as NSString).lastPathComponent))")
+                let micSegs = transcribeTrack(micURL!, roleTag: "mic", whisperExec: whisperExec,
+                                              modelFile: modelFile, lang: lang, dir: dir, sessionTag: sessionTag)
+                let sysSegs = transcribeTrack(systemURL!, roleTag: "system", whisperExec: whisperExec,
+                                              modelFile: modelFile, lang: lang, dir: dir, sessionTag: sessionTag)
+                if let micSegs = micSegs, let sysSegs = sysSegs, !(micSegs.isEmpty && sysSegs.isEmpty) {
+                    fullTranscript = Self.dialogueTranscript(mic: micSegs, system: sysSegs)
+                } else {
+                    log("[Transcriber] [\(sessionTag)] ⚠️ Dual-track path failed — falling back to merged mix")
+                    fullTranscript = transcribeMergedMix(
+                        micURL: micURL, systemURL: systemURL, micOK: micOK, sysOK: sysOK,
+                        whisperExec: whisperExec, modelFile: modelFile, lang: lang,
+                        dir: dir, baseName: baseName, sessionTag: sessionTag)
                 }
-                try? FileManager.default.removeItem(at: tmpBase.appendingPathExtension("txt"))
             } else {
-                let chunks = Int(ceil(duration / chunkSec))
-                log("[Transcriber] [\(sessionTag)] Transcribing \(chunks) chunks (\(Int(duration))s total, model: \((modelFile as NSString).lastPathComponent))...")
-
-                for i in 0..<chunks {
-                    let offset = Double(i) * chunkSec
-                    let chunkWav = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i).wav")
-                    let chunkBase = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i)")
-
-                    let extractResult = runProcess(ffmpegPath, args: [
-                        "-y", "-nostats", "-loglevel", "error", "-i", mergedWav.path,
-                        "-ss", String(Int(offset)), "-t", String(Int(chunkSec)),
-                        "-c:a", "pcm_s16le", chunkWav.path
-                    ])
-                    guard extractResult.exitCode == 0 else {
-                        log("[Transcriber] [\(sessionTag)] ⚠️ Chunk \(i+1) extraction failed, skipping")
-                        continue
-                    }
-
-                    log("[Transcriber] [\(sessionTag)]   Chunk \(i+1)/\(chunks) @ \(Int(offset))s…")
-                    let result = runProcess(whisperExec, args: [
-                        "-m", modelFile, "-l", lang,
-                        "-et", "2.2", "-lpt", "-0.5",
-                        "-otxt", "-of", chunkBase.path,
-                        chunkWav.path
-                    ])
-
-                    if result.exitCode == 0,
-                       let text = try? String(contentsOf: chunkBase.appendingPathExtension("txt"), encoding: .utf8) {
-                        fullTranscript += text
-                    } else {
-                        log("[Transcriber] [\(sessionTag)] ⚠️ Chunk \(i+1) whisper failed (exit \(result.exitCode))")
-                    }
-
-                    try? FileManager.default.removeItem(at: chunkWav)
-                    try? FileManager.default.removeItem(at: chunkBase.appendingPathExtension("txt"))
-                }
+                fullTranscript = transcribeMergedMix(
+                    micURL: micURL, systemURL: systemURL, micOK: micOK, sysOK: sysOK,
+                    whisperExec: whisperExec, modelFile: modelFile, lang: lang,
+                    dir: dir, baseName: baseName, sessionTag: sessionTag)
             }
-
-            try? FileManager.default.removeItem(at: mergedWav)
 
             if !fullTranscript.isEmpty {
                 try? fullTranscript.write(to: txtPath, atomically: true, encoding: .utf8)
@@ -207,6 +146,248 @@ class Transcriber {
 
             DispatchQueue.main.async { completion() }
         }
+    }
+
+    // MARK: - Dual-track (speaker-labeled) transcription
+
+    /// Transcribe a single track into timestamped segments. Applies loudnorm,
+    /// resamples to 16 kHz mono, chunks long audio (10 min) and parses
+    /// whisper's JSON output. Returns nil on hard failure (ffmpeg convert failed).
+    private func transcribeTrack(_ sourceURL: URL, roleTag: String, whisperExec: String,
+                                 modelFile: String, lang: String, dir: URL,
+                                 sessionTag: String) -> [TranscriptSegment]? {
+        let trackWav = dir.appendingPathComponent("_track_\(sessionTag)_\(roleTag).wav")
+        defer { try? FileManager.default.removeItem(at: trackWav) }
+
+        let convert = runProcess(ffmpegPath, args: [
+            "-y", "-nostats", "-loglevel", "error", "-i", sourceURL.path,
+            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            trackWav.path
+        ])
+        guard convert.exitCode == 0 else {
+            log("[Transcriber] [\(sessionTag)] ❌ ffmpeg convert (\(roleTag)) failed (exit \(convert.exitCode)): \(convert.stderr.suffix(300))")
+            return nil
+        }
+
+        let duration = trackDuration(trackWav)
+        let chunkSec = 600.0
+        let chunks = duration <= chunkSec * 1.5 ? 1 : Int(ceil(duration / chunkSec))
+        var segments: [TranscriptSegment] = []
+
+        for i in 0..<chunks {
+            let offsetMs = i * Int(chunkSec) * 1000
+            let chunkWav: URL
+            if chunks == 1 {
+                chunkWav = trackWav
+            } else {
+                let extracted = dir.appendingPathComponent("_chunk_\(sessionTag)_\(roleTag)_\(i).wav")
+                let extract = runProcess(ffmpegPath, args: [
+                    "-y", "-nostats", "-loglevel", "error", "-i", trackWav.path,
+                    "-ss", String(i * Int(chunkSec)), "-t", String(Int(chunkSec)),
+                    "-c:a", "pcm_s16le", extracted.path
+                ])
+                guard extract.exitCode == 0 else {
+                    log("[Transcriber] [\(sessionTag)] ⚠️ \(roleTag) chunk \(i+1) extraction failed, skipping")
+                    continue
+                }
+                chunkWav = extracted
+            }
+
+            if chunks > 1 {
+                log("[Transcriber] [\(sessionTag)]   \(roleTag) chunk \(i+1)/\(chunks)…")
+            } else {
+                log("[Transcriber] [\(sessionTag)]   \(roleTag) track (\(Int(duration))s)…")
+            }
+            let outBase = dir.appendingPathComponent("_whisper_\(sessionTag)_\(roleTag)_\(i)")
+            let jsonURL = outBase.appendingPathExtension("json")
+            let result = runProcess(whisperExec, args: [
+                "-m", modelFile, "-l", lang,
+                "-et", "2.2", "-lpt", "-0.5",
+                "-oj", "-of", outBase.path,
+                chunkWav.path
+            ])
+
+            if result.exitCode == 0, let segs = Self.parseWhisperJSON(jsonURL, offsetMs: offsetMs) {
+                segments += segs
+            } else {
+                log("[Transcriber] [\(sessionTag)] ⚠️ \(roleTag) chunk \(i+1) whisper failed (exit \(result.exitCode))")
+            }
+
+            try? FileManager.default.removeItem(at: jsonURL)
+            if chunks > 1 { try? FileManager.default.removeItem(at: chunkWav) }
+        }
+
+        return segments
+    }
+
+    /// Parse whisper-cli -oj output into segments, shifting offsets by `offsetMs`.
+    /// Drops empty segments and non-speech annotations like "[BLANK_AUDIO]" or "(music)".
+    static func parseWhisperJSON(_ url: URL, offsetMs: Int) -> [TranscriptSegment]? {
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = obj["transcription"] as? [[String: Any]] else { return nil }
+        var segments: [TranscriptSegment] = []
+        for item in items {
+            guard let offsets = item["offsets"] as? [String: Any],
+                  let from = offsets["from"] as? Int,
+                  let to = offsets["to"] as? Int,
+                  let text = item["text"] as? String else { continue }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !isNonSpeechAnnotation(trimmed) else { continue }
+            segments.append(TranscriptSegment(fromMs: from + offsetMs, toMs: to + offsetMs, text: trimmed))
+        }
+        return segments
+    }
+
+    /// Whisper emits sound-event pseudo-segments like "[BLANK_AUDIO]", "(музыка)", "*звонок*".
+    static func isNonSpeechAnnotation(_ text: String) -> Bool {
+        let pairs: [(Character, Character)] = [("[", "]"), ("(", ")"), ("*", "*")]
+        for (open, close) in pairs {
+            if text.first == open && text.last == close { return true }
+        }
+        return false
+    }
+
+    /// Interleave mic ("Я") and system ("Собеседник") segments by start time into
+    /// a dialogue transcript, grouping consecutive same-speaker segments into one line.
+    static func dialogueTranscript(mic: [TranscriptSegment], system: [TranscriptSegment]) -> String {
+        var tagged = mic.map { (seg: $0, speaker: "Я") } + system.map { (seg: $0, speaker: "Собеседник") }
+        tagged.sort { $0.seg.fromMs < $1.seg.fromMs }
+        guard !tagged.isEmpty else { return "" }
+
+        var lines: [String] = []
+        var curSpeaker = tagged[0].speaker
+        var curStart = tagged[0].seg.fromMs
+        var curText = tagged[0].seg.text
+        for entry in tagged.dropFirst() {
+            if entry.speaker == curSpeaker {
+                curText += " " + entry.seg.text
+            } else {
+                lines.append(formatDialogueLine(startMs: curStart, speaker: curSpeaker, text: curText))
+                curSpeaker = entry.speaker
+                curStart = entry.seg.fromMs
+                curText = entry.seg.text
+            }
+        }
+        lines.append(formatDialogueLine(startMs: curStart, speaker: curSpeaker, text: curText))
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    static func formatDialogueLine(startMs: Int, speaker: String, text: String) -> String {
+        let totalSec = startMs / 1000
+        let h = totalSec / 3600
+        let m = (totalSec % 3600) / 60
+        let s = totalSec % 60
+        let ts = h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
+        return "[\(ts)] \(speaker): \(text)"
+    }
+
+    // MARK: - Merged-mix (single-speaker) transcription
+
+    /// The original merged-mono path: mix usable tracks into one 16 kHz wav and
+    /// transcribe as plain text. Used when only one track is usable or the
+    /// dual-track path fails.
+    private func transcribeMergedMix(micURL: URL?, systemURL: URL?, micOK: Bool, sysOK: Bool,
+                                     whisperExec: String, modelFile: String, lang: String,
+                                     dir: URL, baseName: String, sessionTag: String) -> String {
+        let mergedWav = dir.appendingPathComponent(
+            baseName.replacingOccurrences(of: "_mic", with: "_merged")
+                    .replacingOccurrences(of: "_system", with: "_merged") + ".wav"
+        )
+        defer { try? FileManager.default.removeItem(at: mergedWav) }
+
+        // Merge both tracks only when both are long enough. Otherwise use the usable single track
+        // to avoid diluting a good track with a broken one.
+        log("[Transcriber] Preparing audio (\(micOK && sysOK ? "merge mic+system" : (micOK ? "mic only" : "system only")))")
+        let convertResult: ProcessResult
+        if micOK && sysOK {
+            convertResult = runProcess(ffmpegPath, args: [
+                "-y", "-nostats", "-loglevel", "error",
+                "-i", micURL!.path,
+                "-i", systemURL!.path,
+                "-filter_complex",
+                "[0:a]loudnorm=I=-16:TP=-1.5:LRA=11[mic];"
+                + "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11[sys];"
+                + "[mic][sys]amix=inputs=2:duration=longest[a]",
+                "-map", "[a]",
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+                mergedWav.path
+            ])
+        } else {
+            let sourceURL = micOK ? micURL! : systemURL!
+            convertResult = runProcess(ffmpegPath, args: [
+                "-y", "-nostats", "-loglevel", "error", "-i", sourceURL.path,
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+                mergedWav.path
+            ])
+        }
+
+        guard convertResult.exitCode == 0 else {
+            log("[Transcriber] ❌ ffmpeg merge failed (exit \(convertResult.exitCode)): \(convertResult.stderr.suffix(500))")
+            return ""
+        }
+
+        let duration = trackDuration(mergedWav)
+        let chunkSec = 600.0 // 10 minutes per chunk
+        var fullTranscript = ""
+
+        if duration <= chunkSec * 1.5 {
+            log("[Transcriber] Transcribing merged audio (\(Int(duration))s, model: \((modelFile as NSString).lastPathComponent))...")
+            let tmpBase = dir.appendingPathComponent("_whisper_tmp")
+            let result = runProcess(whisperExec, args: [
+                "-m", modelFile, "-l", lang,
+                "-et", "2.2", "-lpt", "-0.5",
+                "-otxt", "-of", tmpBase.path,
+                mergedWav.path
+            ])
+            if result.exitCode == 0,
+               let text = try? String(contentsOf: tmpBase.appendingPathExtension("txt"), encoding: .utf8) {
+                fullTranscript = text
+            } else if result.exitCode != 0 {
+                log("[Transcriber] ❌ Whisper failed (exit \(result.exitCode)): \(result.stderr.suffix(500))")
+            }
+            try? FileManager.default.removeItem(at: tmpBase.appendingPathExtension("txt"))
+        } else {
+            let chunks = Int(ceil(duration / chunkSec))
+            log("[Transcriber] [\(sessionTag)] Transcribing \(chunks) chunks (\(Int(duration))s total, model: \((modelFile as NSString).lastPathComponent))...")
+
+            for i in 0..<chunks {
+                let offset = Double(i) * chunkSec
+                let chunkWav = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i).wav")
+                let chunkBase = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i)")
+
+                let extractResult = runProcess(ffmpegPath, args: [
+                    "-y", "-nostats", "-loglevel", "error", "-i", mergedWav.path,
+                    "-ss", String(Int(offset)), "-t", String(Int(chunkSec)),
+                    "-c:a", "pcm_s16le", chunkWav.path
+                ])
+                guard extractResult.exitCode == 0 else {
+                    log("[Transcriber] [\(sessionTag)] ⚠️ Chunk \(i+1) extraction failed, skipping")
+                    continue
+                }
+
+                log("[Transcriber] [\(sessionTag)]   Chunk \(i+1)/\(chunks) @ \(Int(offset))s…")
+                let result = runProcess(whisperExec, args: [
+                    "-m", modelFile, "-l", lang,
+                    "-et", "2.2", "-lpt", "-0.5",
+                    "-otxt", "-of", chunkBase.path,
+                    chunkWav.path
+                ])
+
+                if result.exitCode == 0,
+                   let text = try? String(contentsOf: chunkBase.appendingPathExtension("txt"), encoding: .utf8) {
+                    fullTranscript += text
+                } else {
+                    log("[Transcriber] [\(sessionTag)] ⚠️ Chunk \(i+1) whisper failed (exit \(result.exitCode))")
+                }
+
+                try? FileManager.default.removeItem(at: chunkWav)
+                try? FileManager.default.removeItem(at: chunkBase.appendingPathExtension("txt"))
+            }
+        }
+
+        return fullTranscript
     }
 
     /// Get media file duration in seconds via ffmpeg. Returns 0 on failure or missing file.

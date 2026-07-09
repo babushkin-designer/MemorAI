@@ -15,6 +15,7 @@ let package = Package(
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("Vision"),
                 .linkedFramework("ApplicationServices"),
+                .linkedFramework("Carbon"),
                 .linkedFramework("UniformTypeIdentifiers"),
             ]
         ),
