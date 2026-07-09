@@ -447,6 +447,39 @@ for _, line in hits:
 PYEOF
 }
 
+cmd_retention() {
+    local action="${1:-run}"
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    local retention_sh="$script_dir/tools/retention.sh"
+
+    case "$action" in
+        run)
+            bash "$retention_sh"
+            ;;
+        install)
+            local plist_src="$script_dir/tools/com.local.memorai.retention.plist"
+            local target="$HOME/Library/LaunchAgents/com.local.memorai.retention.plist"
+            sed "s|__RETENTION_SH__|$retention_sh|" "$plist_src" > "$target"
+            launchctl bootstrap "gui/$(id -u)" "$target" 2>/dev/null || launchctl load "$target"
+            echo "Installed: runs daily at 04:30"
+            ;;
+        uninstall)
+            local target="$HOME/Library/LaunchAgents/com.local.memorai.retention.plist"
+            launchctl bootout "gui/$(id -u)" "$target" 2>/dev/null || launchctl unload "$target" 2>/dev/null || true
+            rm -f "$target"
+            echo "Uninstalled"
+            ;;
+        status)
+            launchctl list | grep com.local.memorai.retention || echo "not installed"
+            ;;
+        *)
+            echo "Usage: memorai retention <run|install|uninstall|status>"
+            return 1
+            ;;
+    esac
+}
+
 cmd_help() {
     cat << 'EOF'
 MemorAI — remembers everything you do on your computer
@@ -477,6 +510,11 @@ Commands:
   exclude remove <bundle-id>  Remove app from exclusion list
   exclude list              List excluded apps
 
+  retention run             Run the retention/log-cap script now
+  retention install         Install the daily LaunchAgent (04:30)
+  retention uninstall       Remove the LaunchAgent
+  retention status          Show whether the LaunchAgent is loaded
+
   help                      Show this help
 EOF
 }
@@ -493,6 +531,7 @@ case "${1:-help}" in
     search)       shift; cmd_search "$@" ;;
     set)          cmd_set "$2" "$3" ;;
     exclude)      cmd_exclude "$2" "$3" ;;
+    retention)    cmd_retention "$2" ;;
     help|--help|-h) cmd_help ;;
     *)            echo "Unknown command: $1"; cmd_help ;;
 esac
