@@ -33,6 +33,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         requestPermissions()
         settings.ensureOutputDirectory()
+        RetentionManager.shared.start()
 
         // --- Screen Memory (init before menu so clipboard history is available) ---
         screenMemory = ScreenMemoryManager()

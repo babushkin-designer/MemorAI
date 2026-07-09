@@ -95,9 +95,12 @@ script also caps `memorai.log`: once it exceeds 10 MB it's truncated in
 place to the last 5 MB (the file's inode is preserved so the running app's
 open log handle stays valid).
 
-Run it once with `memorai retention run`, or schedule it daily at 04:30 via
-a LaunchAgent with `memorai retention install` (`memorai retention status` /
-`memorai retention uninstall` to check or remove it).
+The app runs this policy itself once a day (see
+`AutoRec/RetentionManager.swift`) — no scheduling setup is needed. A
+LaunchAgent can NOT do this job on modern macOS: TCC denies `/bin/bash`
+under launchd access to `~/Downloads`, so `memorai retention install` is
+kept only for data dirs outside TCC-protected folders. For a manual pass
+from a terminal, run `memorai retention run`.
 
 ## Transcription Setup
 
