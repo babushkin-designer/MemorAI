@@ -1,6 +1,7 @@
 # Plan 012 — Manual LLM summary + follow-up for calls
 
-Status: TODO
+Status: DONE — implemented & smoke-tested 2026-07-09 (33 tests green; real
+summary generated via Bluesminds/gpt-5.5, 182 in / 172 out tokens)
 Priority: P2 · Effort: M · Depends on: Recent Calls menu (shipped 2026-07-09)
 
 Methodology: plan-big / execute-small. Each step below is independently
@@ -37,12 +38,20 @@ Keys come from **macOS Keychain** (generic passwords `bluesminds-api-key` /
 `openai-api-key`, account = current user), migrated 2026-07-09. No .env in the
 app. Read via Security framework (SecItemCopyMatching).
 
-### Quota guardrail (hard requirement — from polymarket OPS.md)
+### Quota guardrail (hard requirement — from polymarket OPS.md + program terms)
 
-On HTTP 429 with body `error.code == "insufficient_quota"`:
-STOP, surface an alert ("free tokens exhausted — resume after billing/usage
-action"), do NOT retry. Retry/backoff is only for transient 5xx / network /
-timeout, capped (e.g. 2 tries). Exceeding free quota silently bills real money.
+Program fact (help.openai.com/articles/10306912, confirmed 2026-07-09): when
+the free daily allowance (1M/day large models, 250k on tiers 1-2) is exhausted,
+overage is **silently billed at normal rates** — no error is returned. A
+`429 insufficient_quota` only appears once the paid balance is also gone.
+Therefore:
+- **Default provider = Bluesminds** (separate key, not shared with the trading
+  bots; zero OpenAI free-quota usage).
+- OpenAI direct is a fallback only: hard `max_tokens` cap on every request, and
+  log `usage.prompt_tokens/completion_tokens` from each response to memorai.log.
+- On HTTP 429 with `error.code == "insufficient_quota"`: STOP, alert ("tokens
+  exhausted — resume after billing/usage action"), do NOT retry. Retry/backoff
+  only for transient 5xx / network / timeout, capped (2 tries).
 
 ## Steps
 

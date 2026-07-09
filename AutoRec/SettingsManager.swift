@@ -101,6 +101,22 @@ class SettingsManager {
         set { defaults.set(newValue, forKey: "dictationEnabled") }
     }
 
+    // MARK: - LLM (summary / follow-up)
+
+    /// "bluesminds" (default; separate free-token key) or "openai" (fallback;
+    /// key shared with trading bots — overage silently bills, see plan 012).
+    var llmProvider: String {
+        get { defaults.string(forKey: "llmProvider") ?? "bluesminds" }
+        set { defaults.set(newValue, forKey: "llmProvider") }
+    }
+
+    /// Model id on the selected provider. gpt-5.5 is the verified-working
+    /// default on Bluesminds (claude-* are not enabled on this key).
+    var llmModel: String {
+        get { defaults.string(forKey: "llmModel") ?? "gpt-5.5" }
+        set { defaults.set(newValue, forKey: "llmModel") }
+    }
+
     // MARK: - Helpers
 
     func ensureOutputDirectory() {

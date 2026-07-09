@@ -418,6 +418,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let url = session.micURL { addOpenItem(sub, "🎙 Audio — me (mic)", url) }
             if let url = session.systemURL { addOpenItem(sub, "🔊 Audio — other side", url) }
 
+            if session.transcriptURL != nil {
+                sub.addItem(.separator())
+                let summarize = NSMenuItem(
+                    title: session.summaryURL == nil ? "🤖 Summarize" : "🤖 Re-summarize",
+                    action: #selector(summarizeCall(_:)), keyEquivalent: "")
+                summarize.target = self
+                summarize.representedObject = session.tag
+                summarize.isEnabled = !llmBusy
+                sub.addItem(summarize)
+
+                let followup = NSMenuItem(
+                    title: session.followupURL == nil ? "🤖 Draft Follow-up…" : "🤖 Redraft Follow-up…",
+                    action: #selector(draftFollowup(_:)), keyEquivalent: "")
+                followup.target = self
+                followup.representedObject = session.tag
+                followup.isEnabled = !llmBusy
+                sub.addItem(followup)
+            }
+
             sub.addItem(.separator())
             let reveal = NSMenuItem(title: "Show in Finder", action: #selector(revealCallInFinder(_:)), keyEquivalent: "")
             reveal.target = self
@@ -448,6 +467,73 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openFileURL(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    // MARK: - LLM actions (summary / follow-up)
+
+    /// Prevents parallel LLM jobs; menu items are disabled while true.
+    private var llmBusy = false
+
+    private func sessionForTag(_ tag: String) -> CallSession? {
+        CallHistory.recentSessions(outputPath: settings.outputPath, limit: 100)
+            .first { $0.tag == tag }
+    }
+
+    @objc private func summarizeCall(_ sender: NSMenuItem) {
+        guard let tag = sender.representedObject as? String,
+              let session = sessionForTag(tag) else { return }
+        runLLMJob(kind: .summary, session: session)
+    }
+
+    @objc private func draftFollowup(_ sender: NSMenuItem) {
+        guard let tag = sender.representedObject as? String,
+              let session = sessionForTag(tag) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Follow-up: имя собеседника"
+        alert.informativeText = "Как зовут клиента? Имя подставится вместо «Собеседник». Можно оставить пустым."
+        alert.addButton(withTitle: "Draft")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.placeholderString = "Имя"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        runLLMJob(kind: .followup(otherName: name.isEmpty ? nil : name), session: session)
+    }
+
+    private func runLLMJob(kind: CallLLM.Kind, session: CallSession) {
+        guard !llmBusy else { return }
+        llmBusy = true
+        updateMenu()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = CallLLM.generate(kind, for: session)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.llmBusy = false
+                self.updateMenu()
+                switch result {
+                case .success(let url):
+                    NSWorkspace.shared.open(url)
+                case .failure(let error):
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    if case .quotaExhausted = error {
+                        alert.messageText = "LLM tokens exhausted"
+                        alert.informativeText = "Бесплатные токены исчерпаны (insufficient_quota). Повторов не делаю — сначала разберись с биллингом/лимитами."
+                    } else {
+                        alert.messageText = "LLM request failed"
+                        alert.informativeText = error.localizedDescription
+                    }
+                    NSApp.activate(ignoringOtherApps: true)
+                    alert.runModal()
+                }
+            }
+        }
     }
 
     @objc private func revealCallInFinder(_ sender: NSMenuItem) {

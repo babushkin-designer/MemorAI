@@ -55,3 +55,17 @@ per-day `index.jsonl` (one JSON record per screenshot; legacy per-shot
 - Conventions: no external Swift dependencies; callbacks over delegates;
   all logging through the global `log()`; single-line imperative commit
   messages.
+
+## LLM layer (summary / follow-up, plan 012)
+
+- Manual only, from the Recent Calls submenu. Writes `call_<tag>_summary.md`
+  / `_followup.md` next to the transcript.
+- OpenAI-compatible chat completions: default provider Bluesminds
+  (`gpt-5.5`; claude-* NOT enabled on this key), fallback OpenAI direct.
+  Keys are macOS Keychain generic passwords `bluesminds-api-key` /
+  `openai-api-key` (account = current user) — never .env, never log keys.
+- HARD RULE: on 429 `insufficient_quota` stop and alert; never retry (past
+  the free daily allowance OpenAI silently bills real money). Retry (max 2)
+  only on transport/5xx. Always cap max_tokens and log usage tokens.
+- `swift test` must stay offline — network calls live only in thin
+  LLMClient.post; everything parseable is a pure static helper with tests.
