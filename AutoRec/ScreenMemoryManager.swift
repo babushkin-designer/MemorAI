@@ -16,7 +16,19 @@ class ScreenMemoryManager {
     private let hashThreshold = 10
     private let keyPressThreshold = 30
 
+    /// Pause capturing after this many seconds with no keyboard/mouse input.
+    /// Handles an unattended-but-awake machine (e.g. background trading bots
+    /// keeping dashboards live overnight): the screen changes but the user is
+    /// away, so there is nothing worth recording.
+    private let idlePauseSeconds: Double = 300
+    private var idlePaused = false
+
     private(set) var isRunning = false
+
+    /// Set while the session is locked or the display is asleep — capturing then
+    /// only wastes CPU and records junk (e.g. the lock-screen clock ticking once
+    /// a minute), so the tick is skipped until the screen is back.
+    private var screenOff = false
 
     func start() {
         guard !isRunning else { return }
@@ -31,6 +43,7 @@ class ScreenMemoryManager {
         clipboard.start(storageURL: outputURL)
         startClipboardPolling()
         startKeyboardMonitoring()
+        startScreenStateMonitoring()
 
         let thread = Thread { [weak self] in
             while let self = self, self.isRunning {
@@ -49,6 +62,40 @@ class ScreenMemoryManager {
         clipboardSource?.cancel()
         clipboardSource = nil
         stopKeyboardMonitoring()
+        stopScreenStateMonitoring()
+    }
+
+    // MARK: - Screen Lock / Sleep
+
+    private func startScreenStateMonitoring() {
+        // Session lock/unlock (e.g. screen locked overnight).
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(self, selector: #selector(screenWentOff),
+                        name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
+        dnc.addObserver(self, selector: #selector(screenCameBack),
+                        name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
+        // Display sleep/wake (e.g. lid closed or display timeout).
+        let wsnc = NSWorkspace.shared.notificationCenter
+        wsnc.addObserver(self, selector: #selector(screenWentOff),
+                         name: NSWorkspace.screensDidSleepNotification, object: nil)
+        wsnc.addObserver(self, selector: #selector(screenCameBack),
+                         name: NSWorkspace.screensDidWakeNotification, object: nil)
+    }
+
+    private func stopScreenStateMonitoring() {
+        DistributedNotificationCenter.default().removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    @objc private func screenWentOff() {
+        screenOff = true
+        log("[ScreenMemory] paused (screen locked or asleep)")
+    }
+
+    @objc private func screenCameBack() {
+        screenOff = false
+        lastSavedHash = 0  // force a fresh capture on return
+        log("[ScreenMemory] resumed (screen on)")
     }
 
     // MARK: - Capture Tick
@@ -58,6 +105,20 @@ class ScreenMemoryManager {
         let outputURL = URL(fileURLWithPath: settings.outputPath)
 
         guard settings.screenMemoryEnabled else { return }
+        guard !screenOff else { return }
+
+        // Skip while the user is idle (no input), even if the screen is changing.
+        let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState,
+                                                           eventType: CGEventType(rawValue: ~0)!)
+        if idle >= idlePauseSeconds {
+            if !idlePaused { idlePaused = true; log("[ScreenMemory] paused (user idle)") }
+            return
+        }
+        if idlePaused {
+            idlePaused = false
+            lastSavedHash = 0  // capture a fresh frame on return
+            log("[ScreenMemory] resumed (user active)")
+        }
 
         // Check if current app is excluded
         let currentApp = metadata.activeAppBundleID() ?? ""

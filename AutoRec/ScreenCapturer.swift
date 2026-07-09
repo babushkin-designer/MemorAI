@@ -55,8 +55,28 @@ class ScreenCapturer {
         (a ^ b).nonzeroBitCount
     }
 
+    /// Downscale so the width is at most `maxWidth`, preserving aspect ratio.
+    /// Full Retina frames (≈3000px) are 3–4× larger on disk than needed for
+    /// visual reference and OCR; 1600px keeps text legible at a fraction of the size.
+    private func downscale(_ image: CGImage, maxWidth: Int = 1600) -> CGImage {
+        guard image.width > maxWidth else { return image }
+        let scale = Double(maxWidth) / Double(image.width)
+        let w = maxWidth
+        let h = max(1, Int((Double(image.height) * scale).rounded()))
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return image }
+        ctx.interpolationQuality = .medium
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage() ?? image
+    }
+
     /// Save image as HEIF (preferred) or JPEG (fallback). Returns saved URL or nil.
     func saveImage(_ image: CGImage, to preferredURL: URL, quality: Float = 0.5) -> URL? {
+        let scaled = downscale(image)
         let formats: [(UTType, String)] = [(.heif, "heif"), (.jpeg, "jpg")]
         for (format, ext) in formats {
             let url = preferredURL.deletingPathExtension().appendingPathExtension(ext)
@@ -69,7 +89,7 @@ class ScreenCapturer {
             let opts: [CFString: Any] = [
                 kCGImageDestinationLossyCompressionQuality: quality
             ]
-            CGImageDestinationAddImage(dest, image, opts as CFDictionary)
+            CGImageDestinationAddImage(dest, scaled, opts as CFDictionary)
             if CGImageDestinationFinalize(dest) {
                 return url
             }

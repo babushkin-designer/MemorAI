@@ -27,6 +27,7 @@ mkdir -p MemorAI.app/Contents/Resources
 cp .build/release/MemorAI MemorAI.app/Contents/MacOS/
 cp Info.plist MemorAI.app/Contents/
 cp MemorAI.icns MemorAI.app/Contents/Resources/ 2>/dev/null || true
+cp AutoRec/ocr_sidecar.py MemorAI.app/Contents/Resources/ 2>/dev/null || true
 
 cat > /tmp/memorai-entitlements.plist << 'ENTITLEMENTS'
 <?xml version="1.0" encoding="UTF-8"?>
