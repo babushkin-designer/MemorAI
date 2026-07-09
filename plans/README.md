@@ -17,38 +17,30 @@ below records everything found, including unplanned items.
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
-| 001  | Eliminate subprocess pipe-buffer deadlock in Transcriber | P1 | S | — | DONE — approved 2026-07-09; branch `advisor/001-pipe-deadlock` @ 327da84 (reviewer note: final post-exit drain still uses readDataToEndOfFile — safe, process already exited) |
-| 002  | Stop persisting concealed clipboard content (passwords) | P1 | S | — | DONE — approved 2026-07-09; branch `advisor/002-concealed-clipboard` @ 3d2b367, worktree /private/tmp/claude/wt-002 (GUI check skipped: no GUI in executor env) |
-| 003  | Finalize in-flight recordings before app termination | P1 | M | — | DONE — approved 2026-07-09; branch `advisor/003-graceful-shutdown` @ 39007fa, worktree /tmp/claude/wt-003 (GUI check skipped: no GUI in executor env) |
-| 004  | Make CLI and README match the index.jsonl storage format | P2 | M | — | DONE — approved 2026-07-09; branch `advisor/004-cli-index-jsonl` @ 62bea0b, worktree /tmp/claude/wt-004 (fixture test re-run by reviewer: pass) |
-| 005  | Make the OCR sidecar hang-proof and self-healing | P2 | M | owner must commit the in-flight OCR changes first | BLOCKED — waiting for the uncommitted OCRProcessor/ocr_sidecar work to be committed |
-| 006  | Establish a test baseline for the pure logic | P1 | M | — | DONE — approved 2026-07-09; branch `advisor/006-test-baseline` @ b6e1fe2, worktree /tmp/claude/wt-006; 14 tests, re-run by reviewer. MERGE CAVEAT: touches OCRProcessor.swift, which has uncommitted RapidOCR changes in the owner's tree — commit those first, then merge and re-apply the `private` removal on extractStructuredData in the RapidOCR version if needed |
-| 007  | Serialize start/stop (orphaned-session race) | P2 | M | 003 | DONE — approved 2026-07-09; branch `advisor/007-start-stop-race` @ d1b1759 (on top of advisor/003), worktree /tmp/claude/wt-007 |
-| 008  | Schedule retention + cap memorai.log | P2 | S | 010 (branch base) | DONE — approved 2026-07-09; branch `advisor/008-retention` @ 6e2b6f7 (on top of advisor/010), worktree /tmp/claude/wt-008. NOTE: launchctl already shows a loaded `com.local.memorai.retention` on this machine (pre-existing, outside the repo) — inspect ~/Library/LaunchAgents before running `memorai retention install` |
-| 009  | Graceful `memorai stop`, precise pgrep/pkill | P3 | S | 008 (branch base; CLI chain 010→008→009) | DONE — approved 2026-07-09; branch `advisor/009-cli-graceful-stop` @ 4e41f86 (tip of the CLI chain), worktree /tmp/claude/wt-009 (live-app behavioral check skipped by design) |
-| 010  | `memorai search` over OCR/clipboard/transcripts | P2 | M | 004 | DONE — approved 2026-07-09; branch `advisor/010-search` @ af29389 (on top of advisor/004), worktree /tmp/claude/wt-010 (fixture tests re-run by reviewer: 6/6 pass; executor fixed a real arg-order bug caught by the tests) |
-| 011  | Add CLAUDE.md for agent onboarding | P3 | S | — | DONE — approved 2026-07-09; branch `advisor/011-claude-md` @ 0c7b4ee, worktree /tmp/claude/wt-011 |
+| 001  | Eliminate subprocess pipe-buffer deadlock in Transcriber | P1 | S | — | DONE — approved & merged to main 2026-07-09 |
+| 002  | Stop persisting concealed clipboard content (passwords) | P1 | S | — | DONE — approved & merged to main 2026-07-09 |
+| 003  | Finalize in-flight recordings before app termination | P1 | M | — | DONE — approved & merged to main 2026-07-09 |
+| 004  | Make CLI and README match the index.jsonl storage format | P2 | M | — | DONE — approved & merged to main 2026-07-09 |
+| 005  | Make the OCR sidecar hang-proof and self-healing | P2 | M | — | DONE — approved & merged to main 2026-07-09 (hang-recovery verified via standalone harness against a wedged sidecar fixture) |
+| 006  | Establish a test baseline for the pure logic | P1 | M | — | DONE — approved & merged to main 2026-07-09 |
+| 007  | Serialize start/stop (orphaned-session race) | P2 | M | 003 | DONE — approved & merged to main 2026-07-09 |
+| 008  | Schedule retention + cap memorai.log | P2 | S | 010 (branch base) | DONE — approved & merged to main 2026-07-09 |
+| 009  | Graceful `memorai stop`, precise pgrep/pkill | P3 | S | 008 (branch base; CLI chain 010→008→009) | DONE — approved & merged to main 2026-07-09 |
+| 010  | `memorai search` over OCR/clipboard/transcripts | P2 | M | 004 | DONE — approved & merged to main 2026-07-09 |
+| 011  | Add CLAUDE.md for agent onboarding | P3 | S | — | DONE — approved & merged to main 2026-07-09 |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
 ## Dependency notes
 
-- Batch 1 (001–004): no hard dependencies; all four DONE and approved on
-  `advisor/*` branches. This is a local fork — branches are never pushed;
-  merging into the owner's branch is the owner's action.
-- 005 is BLOCKED until the owner commits the in-flight OCR sidecar changes
-  (worktrees branch from HEAD and would get the stale file).
-- 007 branches off `advisor/003-graceful-shutdown` (extends its
-  `stopRecording` changes). 009 and 010 branch off
-  `advisor/004-cli-index-jsonl` (extend the rewritten CLI / reuse
-  `emit_day_records`). If those branches are merged into the owner's branch
-  first, executors branch from there instead — each plan's drift check
-  covers it.
-- 008 merge caveat: the owner's tree has an UNTRACKED `tools/retention.sh`;
-  before merging `advisor/008-retention`, remove or stash that untracked
-  copy (the branch commits an extended version of the same content).
-- 006 should land before any larger Swift refactor; it's independent of the
-  rest.
+- 2026-07-09: plans 001–004 and 006–011 are all merged to `main` (owner
+  authorized the merges); their `advisor/*` branches and worktrees were
+  removed. The OCR sidecar work was committed as `5116b71`, unblocking 005.
+- Post-merge verification on main: `swift build` and `swift test` (14 tests)
+  both pass.
+- Historical note: 007 was built on 003's branch, 008/009/010 formed a
+  stacked CLI chain on 004's branch to avoid conflicts in `memorai`.
+- Local fork: nothing is ever pushed to a remote.
 
 ## Full findings table (audit of 2026-07-09, standard depth)
 
