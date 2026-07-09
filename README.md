@@ -85,6 +85,20 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
   call_<timestamp>_transcript.txt   # transcription (if enabled)
 ```
 
+## Retention
+
+Screenshots accumulate quickly, so `tools/retention.sh` deletes screenshot
+*images* (`.jpg`/`.heif`/`.png`) older than 14 days (override with
+`RETENTION_DAYS`). It never deletes OCR text (`index.jsonl`), clipboard
+history, call recordings, or transcripts — those are kept forever. The same
+script also caps `memorai.log`: once it exceeds 10 MB it's truncated in
+place to the last 5 MB (the file's inode is preserved so the running app's
+open log handle stays valid).
+
+Run it once with `memorai retention run`, or schedule it daily at 04:30 via
+a LaunchAgent with `memorai retention install` (`memorai retention status` /
+`memorai retention uninstall` to check or remove it).
+
 ## Transcription Setup
 
 ```bash
