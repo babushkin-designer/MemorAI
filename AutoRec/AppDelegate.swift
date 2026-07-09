@@ -9,6 +9,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = SettingsManager.shared
     private var whisperAlertShown = false
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        screenMemory.stop()
+        let state = recordingManager?.state ?? .idle
+        guard state == .recording || state == .starting || state == .paused || state == .stopping else {
+            return .terminateNow
+        }
+        log("[AppDelegate] Terminate requested during recording — finalizing first")
+        recordingManager.stopRecording(source: "app-quit") {
+            DispatchQueue.main.async {
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        // Failsafe: never hang quit for more than 10s.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            NSApp.reply(toApplicationShouldTerminate: true)  // no-op if already replied
+        }
+        return .terminateLater
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
@@ -424,8 +443,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func quit() {
-        screenMemory.stop()
-        recordingManager.stopRecording()
         NSApp.terminate(nil)
     }
 
