@@ -2,14 +2,14 @@
 
 Remembers everything you do on your computer for AI.
 
-MemorAI sits in your menu bar and silently captures your digital life — screen activity, clipboard history, and phone calls. Everything stays local on your machine: screenshots are OCR'd via Apple Vision, calls are transcribed via whisper.cpp. The result is a structured, searchable archive of your workday that's ready for AI-powered retrieval.
+MemorAI sits in your menu bar and silently captures your digital life — screen activity, clipboard history, and phone calls. Everything stays local on your machine: screenshots are OCR'd via a local RapidOCR ONNX sidecar, calls are transcribed via whisper.cpp. The result is a structured, searchable archive of your workday that's ready for AI-powered retrieval.
 
 ## Features
 
 ### Screen Memory
 - **Periodic screenshots** — captures screen every N seconds (configurable 1–30s)
 - **Smart change detection** — only saves when something actually changed (perceptual hash)
-- **OCR** — Apple Vision extracts text from every screenshot (Russian + English)
+- **OCR** — a local RapidOCR ONNX Python sidecar extracts text from every screenshot (Russian + English)
 - **Structured extraction** — URLs, emails, phone numbers parsed from OCR text
 - **Metadata** — active app, window title, browser URL saved with each capture
 - **App exclusions** — skip recording for specific apps (Telegram, YouTube, etc.)
@@ -35,7 +35,7 @@ MemorAI sits in your menu bar and silently captures your digital life — screen
 ## Build & Run
 
 ```bash
-cd side-projects/memorAI
+cd MemorAI
 bash bundle.sh
 open MemorAI.app
 ```
@@ -74,8 +74,8 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
   clipboard.jsonl                    # clipboard history
   screen/
     2026-03-22/
-      14-30-05.jpg                   # screenshot
-      14-30-05.json                  # {app, window_title, ocr_text, urls, ...}
+      14-30-05.heif                  # screenshot
+      index.jsonl                    # one JSON record per screenshot: {timestamp, image_file, app_name, window_title, ocr_text, urls, ...}
   call_<timestamp>_system.m4a       # system audio
   call_<timestamp>_mic.m4a          # microphone
   call_<timestamp>_screen.mp4       # screen (if enabled)
@@ -92,6 +92,16 @@ curl -L "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
 ```
 
 For better Russian recognition, use `ggml-medium.bin` instead.
+
+## OCR Setup
+
+```bash
+# find a Homebrew python3 (checked in this order)
+/opt/homebrew/bin/python3 -m pip install rapidocr_onnxruntime || \
+/usr/local/bin/python3 -m pip install rapidocr_onnxruntime
+```
+
+RapidOCR runs as a local Python sidecar (Russian + English); no cloud calls.
 
 ## License
 
