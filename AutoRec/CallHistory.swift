@@ -13,8 +13,18 @@ struct CallSession {
     var transcriptURL: URL?  // call_<tag>_transcript.txt
     var summaryURL: URL?     // call_<tag>_summary.md
     var followupURL: URL?    // call_<tag>_followup.md
+    var titleURL: URL?       // call_<tag>_title.txt (one-line LLM-generated name)
 
     var hasAudio: Bool { micURL != nil || systemURL != nil }
+
+    /// One-line human title, if generated. Read lazily; nil when absent/empty.
+    var title: String? {
+        guard let url = titleURL,
+              let raw = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let line = raw.components(separatedBy: .newlines).first?
+            .trimmingCharacters(in: .whitespaces) ?? ""
+        return line.isEmpty ? nil : line
+    }
 }
 
 /// Read-only scanner over the output directory that groups `call_*` files into
@@ -45,6 +55,7 @@ enum CallHistory {
             case "transcript": session.transcriptURL = url
             case "summary":    session.summaryURL = url
             case "followup":   session.followupURL = url
+            case "title":      session.titleURL = url
             default:           break
             }
             byTag[tag] = session

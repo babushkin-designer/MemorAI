@@ -83,6 +83,63 @@ enum CallLLM {
         return (system, user)
     }
 
+    /// Titles need only the shape of the call — the head of the transcript is
+    /// enough and keeps every title generation at ~1k tokens.
+    static let titleTranscriptChars = 4000
+
+    static func titlePrompt(transcript: String) -> (system: String, user: String) {
+        let system = """
+        Ты придумываешь короткое название для записи рабочего звонка. Транскрипт диаризован: \
+        "Я" — Илья, "Собеседник" — остальные участники (имена ищи в контексте). \
+        Ответь ОДНОЙ строкой: 3-6 слов, о чём звонок и с кем (если имя понятно из контекста). \
+        Без кавычек, без точки в конце, без пояснений. Примеры формата: \
+        "Правки лендинга с Егором", "Синк по дизайн-системе", "Созвон с клиентом: логотип".
+        """
+        let user = """
+        Назови этот звонок.
+
+        Начало транскрипта:
+        \(String(transcript.prefix(titleTranscriptChars)))
+        """
+        return (system, user)
+    }
+
+    /// LLM output → safe one-line menu title.
+    static func sanitizeTitle(_ raw: String) -> String {
+        var line = raw.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty } ?? ""
+        line = line.trimmingCharacters(in: CharacterSet(charactersIn: "\"«»'.“” "))
+        if line.count > 60 { line = String(line.prefix(59)) + "…" }
+        return line
+    }
+
+    /// Generate `call_<tag>_title.txt` for a session. No-op when a title
+    /// already exists or the transcript is missing. Safe to call repeatedly.
+    @discardableResult
+    static func generateTitle(for session: CallSession) -> Bool {
+        guard session.title == nil,
+              let transcriptURL = session.transcriptURL,
+              let transcript = try? String(contentsOf: transcriptURL, encoding: .utf8),
+              transcript.trimmingCharacters(in: .whitespacesAndNewlines).count >= 40 else {
+            return false
+        }
+        let prompt = titlePrompt(transcript: transcript)
+        switch LLMClient.shared.complete(system: prompt.system, user: prompt.user) {
+        case .failure(let error):
+            log("[CallLLM] ⚠️ Title generation failed for \(session.tag): \(error.localizedDescription)")
+            return false
+        case .success(let raw):
+            let title = sanitizeTitle(raw)
+            guard !title.isEmpty else { return false }
+            let url = transcriptURL.deletingLastPathComponent()
+                .appendingPathComponent("call_\(session.tag)_title.txt")
+            try? (title + "\n").write(to: url, atomically: true, encoding: .utf8)
+            log("[CallLLM] 🏷 \(session.tag): \(title)")
+            return true
+        }
+    }
+
     static func truncated(_ transcript: String) -> String {
         guard transcript.count > maxTranscriptChars else { return transcript }
         let half = maxTranscriptChars / 2

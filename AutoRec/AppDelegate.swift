@@ -65,6 +65,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordingManager.onSystemAudioUnavailable = { [weak self] in
             self?.callDetector.reportSystemAudioUnavailable()
         }
+        recordingManager.onTranscriptionDone = { [weak self] in
+            self?.autoTitleLatestCall()
+        }
 
         // --- Dictation (fn) ---
         dictation = DictationManager()
@@ -399,6 +402,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return submenu
         }
 
+        let untitled = sessions.filter { $0.transcriptURL != nil && $0.title == nil }
+        if !untitled.isEmpty {
+            let backfill = NSMenuItem(title: "🏷 Generate Missing Titles (\(untitled.count))",
+                                      action: #selector(generateMissingTitles), keyEquivalent: "")
+            backfill.target = self
+            backfill.isEnabled = !llmBusy
+            submenu.addItem(backfill)
+            submenu.addItem(.separator())
+        }
+
         for session in sessions {
             let item = NSMenuItem(title: callDisplayName(session), action: nil, keyEquivalent: "")
             let sub = NSMenu()
@@ -461,6 +474,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         f.dateFormat = Calendar.current.isDateInToday(session.date) ? "HH:mm" : "dd.MM HH:mm"
         let when = session.date == .distantPast ? session.tag : f.string(from: session.date)
         let kind = session.videoURL != nil ? "🎬" : "🎙"
+        if let title = session.title {
+            return "\(kind) \(when) — \(title)"
+        }
         return "\(kind) \(when)"
     }
 
@@ -477,6 +493,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func sessionForTag(_ tag: String) -> CallSession? {
         CallHistory.recentSessions(outputPath: settings.outputPath, limit: 100)
             .first { $0.tag == tag }
+    }
+
+    /// Auto-title the freshest transcribed call (hooked to onTranscriptionDone),
+    /// and the manual backfill for older untitled ones.
+    @objc private func generateMissingTitles() {
+        guard !llmBusy else { return }
+        llmBusy = true
+        updateMenu()
+        let outputPath = settings.outputPath
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let untitled = CallHistory.recentSessions(outputPath: outputPath, limit: 100)
+                .filter { $0.transcriptURL != nil && $0.title == nil }
+            var done = 0
+            for session in untitled {
+                if CallLLM.generateTitle(for: session) { done += 1 }
+            }
+            log("[CallLLM] Title backfill: \(done)/\(untitled.count) generated")
+            DispatchQueue.main.async {
+                self?.llmBusy = false
+                self?.updateMenu()
+            }
+        }
+    }
+
+    private func autoTitleLatestCall() {
+        let outputPath = settings.outputPath
+        DispatchQueue.global(qos: .utility).async {
+            guard let latest = CallHistory.recentSessions(outputPath: outputPath, limit: 5)
+                .first(where: { $0.transcriptURL != nil && $0.title == nil }) else { return }
+            CallLLM.generateTitle(for: latest)
+        }
     }
 
     @objc private func summarizeCall(_ sender: NSMenuItem) {

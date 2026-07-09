@@ -78,6 +78,21 @@ final class CallLLMTests: XCTestCase {
         XCTAssertTrue(p.user.contains("## Участники"))
     }
 
+    func testTitlePromptUsesOnlyTranscriptHead() {
+        let long = "НАЧАЛО " + String(repeating: "x", count: 10_000)
+        let p = CallLLM.titlePrompt(transcript: long)
+        XCTAssertTrue(p.user.contains("НАЧАЛО"))
+        XCTAssertLessThan(p.user.count, CallLLM.titleTranscriptChars + 500)
+    }
+
+    func testSanitizeTitle() {
+        XCTAssertEqual(CallLLM.sanitizeTitle("«Правки лендинга с Егором».\n"), "Правки лендинга с Егором")
+        XCTAssertEqual(CallLLM.sanitizeTitle("\n\n  Синк по дизайну  "), "Синк по дизайну")
+        let long = CallLLM.sanitizeTitle(String(repeating: "а", count: 100))
+        XCTAssertEqual(long.count, 60)
+        XCTAssertTrue(long.hasSuffix("…"))
+    }
+
     func testTruncationKeepsHeadAndTail() {
         let long = String(repeating: "a", count: 150_000)
             + "MIDDLE"
