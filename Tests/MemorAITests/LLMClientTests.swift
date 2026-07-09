@@ -63,12 +63,19 @@ final class CallLLMTests: XCTestCase {
         XCTAssertTrue(p.system.contains("Илья"))
     }
 
-    func testFollowupPromptSubstitutesName() {
-        let p = CallLLM.followupPrompt(transcript: "t", otherName: "Саша")
-        XCTAssertTrue(p.system.contains("Саша"))
-        XCTAssertFalse(p.system.contains("неизвестно"))
+    func testFollowupPromptSubstitutesParticipants() {
+        let p = CallLLM.followupPrompt(transcript: "t", otherName: "Егор — клиент, Полина — маркетолог")
+        XCTAssertTrue(p.system.contains("Егор — клиент, Полина — маркетолог"))
+        XCTAssertTrue(p.system.contains("приоритетнее"))
         let anon = CallLLM.followupPrompt(transcript: "t", otherName: nil)
-        XCTAssertTrue(anon.system.contains("неизвестно"))
+        XCTAssertTrue(anon.system.contains("определи их имена"))
+        XCTAssertFalse(anon.system.contains("приоритетнее"))
+    }
+
+    func testSummaryPromptAsksForParticipantInference() {
+        let p = CallLLM.summaryPrompt(transcript: "t")
+        XCTAssertTrue(p.system.contains("имена участников из контекста"))
+        XCTAssertTrue(p.user.contains("## Участники"))
     }
 
     func testTruncationKeepsHeadAndTail() {

@@ -490,12 +490,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let session = sessionForTag(tag) else { return }
 
         let alert = NSAlert()
-        alert.messageText = "Follow-up: имя собеседника"
-        alert.informativeText = "Как зовут клиента? Имя подставится вместо «Собеседник». Можно оставить пустым."
+        alert.messageText = "Follow-up: участники"
+        alert.informativeText = "Кто был на звонке со стороны клиента? Через запятую, можно с ролями (\"Егор — клиент, Полина — маркетолог\"). Пусто — модель определит имена сама из транскрипта."
         alert.addButton(withTitle: "Draft")
         alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
-        field.placeholderString = "Имя"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        field.placeholderString = "Егор — клиент, Полина — маркетолог"
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
         NSApp.activate(ignoringOtherApps: true)
