@@ -225,7 +225,7 @@ class Transcriber {
     }
 
     /// Remove hallucination loops: exact duplicates and near-duplicate runs.
-    private func deduplicateTranscript(at url: URL) {
+    func deduplicateTranscript(at url: URL) {
         guard let content = try? String(contentsOf: url, encoding: .utf8) else { return }
         let lines = content.components(separatedBy: "\n")
 
