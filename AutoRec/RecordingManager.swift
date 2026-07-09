@@ -18,6 +18,10 @@ class RecordingManager {
     private var systemAudioRecorder: SystemAudioRecorder?
     private var micRecorder: MicRecorder?
     private let settings = SettingsManager.shared
+    /// Completions queued when `stopRecording` is called again while a stop
+    /// `Task` is already in flight (state == .stopping); drained once that
+    /// in-flight task finishes finalizing the writers.
+    private var pendingStopCompletions: [() -> Void] = []
 
     // Track current session file URLs for transcription
     private var currentMicURL: URL?
@@ -105,8 +109,20 @@ class RecordingManager {
         log("[RecordingManager] Resumed")
     }
 
-    func stopRecording(source: String = "manual") {
-        guard state == .recording || state == .starting || state == .paused else { return }
+    func stopRecording(source: String = "manual", completion: (() -> Void)? = nil) {
+        guard state == .recording || state == .starting || state == .paused else {
+            if state == .stopping {
+                // A stop Task is already in flight; queue this completion so it
+                // fires once that task finishes finalizing the writers, instead
+                // of firing early (before finalization) or being dropped.
+                if let completion = completion {
+                    pendingStopCompletions.append(completion)
+                }
+            } else {
+                completion?()
+            }
+            return
+        }
         log("[RecordingManager] Recording stopped (source: \(source))")
         setState(.stopping)
 
@@ -122,6 +138,13 @@ class RecordingManager {
             setState(.idle)
             onRecordingActiveChanged?(false)
             log("[RecordingManager] All recorders stopped")
+
+            completion?()
+            let queued = pendingStopCompletions
+            pendingStopCompletions = []
+            for pending in queued {
+                DispatchQueue.main.async { pending() }
+            }
 
             // Mux mic + system audio into screen.mp4 in-place so the video file is
             // self-contained for downstream playback. Runs in parallel with transcription.
