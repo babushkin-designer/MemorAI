@@ -108,7 +108,7 @@ class Transcriber {
             let convertResult: ProcessResult
             if micOK && sysOK {
                 convertResult = runProcess(ffmpegPath, args: [
-                    "-y",
+                    "-y", "-nostats", "-loglevel", "error",
                     "-i", micURL!.path,
                     "-i", systemURL!.path,
                     "-filter_complex",
@@ -122,7 +122,7 @@ class Transcriber {
             } else {
                 let sourceURL = micOK ? micURL! : systemURL!
                 convertResult = runProcess(ffmpegPath, args: [
-                    "-y", "-i", sourceURL.path,
+                    "-y", "-nostats", "-loglevel", "error", "-i", sourceURL.path,
                     "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
                     mergedWav.path
                 ])
@@ -166,7 +166,7 @@ class Transcriber {
                     let chunkBase = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i)")
 
                     let extractResult = runProcess(ffmpegPath, args: [
-                        "-y", "-i", mergedWav.path,
+                        "-y", "-nostats", "-loglevel", "error", "-i", mergedWav.path,
                         "-ss", String(Int(offset)), "-t", String(Int(chunkSec)),
                         "-c:a", "pcm_s16le", chunkWav.path
                     ])
@@ -212,7 +212,7 @@ class Transcriber {
     /// Get media file duration in seconds via ffmpeg. Returns 0 on failure or missing file.
     private func trackDuration(_ url: URL?) -> Double {
         guard let url = url, FileManager.default.fileExists(atPath: url.path) else { return 0 }
-        let result = runProcess(ffmpegPath, args: ["-i", url.path, "-f", "null", "-"], timeout: 10)
+        let result = runProcess(ffmpegPath, args: ["-hide_banner", "-nostats", "-i", url.path, "-f", "null", "-"], timeout: 10)
         let output = result.stderr
         if let match = try? NSRegularExpression(pattern: #"Duration: (\d+):(\d+):(\d+\.\d+)"#)
                 .firstMatch(in: output, range: NSRange(output.startIndex..., in: output)) {
@@ -350,9 +350,25 @@ class Transcriber {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
+        // Drain both pipes as data arrives so the child never blocks on a full
+        // pipe buffer (ffmpeg's stderr stats exceed 64 KB on long inputs).
+        var stdoutData = Data()
+        var stderrData = Data()
+        let ioQueue = DispatchQueue(label: "com.local.memorai.process-io")
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            ioQueue.async { stdoutData.append(chunk) }
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            ioQueue.async { stderrData.append(chunk) }
+        }
+
         do {
             try process.run()
         } catch {
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
             return ProcessResult(exitCode: -1, stdout: "", stderr: error.localizedDescription)
         }
 
@@ -371,8 +387,17 @@ class Transcriber {
         process.waitUntilExit()
         timer.cancel()
 
-        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // Stop handlers, then collect any remaining buffered bytes synchronously.
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+        let finalOut = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let finalErr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let (outData, errData): (Data, Data) = ioQueue.sync {
+            (stdoutData + finalOut, stderrData + finalErr)
+        }
+
+        let stdout = String(data: outData, encoding: .utf8) ?? ""
+        let stderr = String(data: errData, encoding: .utf8) ?? ""
         let exitCode: Int32 = timedOut ? -2 : process.terminationStatus
         if timedOut {
             log("[Transcriber] ⏱ Process timed out after \(Int(deadline))s: \((path as NSString).lastPathComponent)")
