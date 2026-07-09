@@ -31,6 +31,18 @@ class ClipboardMonitor {
         guard current != lastChangeCount else { return }
         lastChangeCount = current
 
+        // Honor the de-facto standard privacy markers set by password managers
+        // and clipboard tools: never persist concealed or transient contents.
+        // http://nspasteboard.org
+        let privacyMarkers: [NSPasteboard.PasteboardType] = [
+            NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"),
+            NSPasteboard.PasteboardType("org.nspasteboard.TransientType"),
+        ]
+        if let types = pasteboard.types, privacyMarkers.contains(where: types.contains) {
+            log("[Clipboard] Skipped concealed/transient clipboard entry")
+            return
+        }
+
         // Skip excluded apps
         let frontApp = NSWorkspace.shared.frontmostApplication
         if let bundleId = frontApp?.bundleIdentifier,
