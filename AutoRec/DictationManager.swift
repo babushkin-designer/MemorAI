@@ -62,6 +62,9 @@ class DictationManager {
 
     private let workQueue = DispatchQueue(label: "com.local.memorai.dictation", qos: .userInitiated)
 
+    /// Persistent dictation history (menu re-copy; never lose text if paste misses).
+    let history = DictationHistory(outputPath: SettingsManager.shared.outputPath)
+
     private var language: String { SettingsManager.shared.whisperLanguage }
 
     // MARK: - fn-key monitoring
@@ -185,6 +188,7 @@ class DictationManager {
                 return
             }
             log("[Dictation] Recognized \(text.count) chars")
+            self.history.add(text)
             DispatchQueue.main.async { self.paste(text) }
         }
     }

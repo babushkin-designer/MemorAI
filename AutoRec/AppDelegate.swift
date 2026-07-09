@@ -198,6 +198,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupItem.target = self
         menu.addItem(setupItem)
 
+        // --- Recent Calls ---
+        let callsItem = NSMenuItem(title: "Recent Calls", action: nil, keyEquivalent: "")
+        callsItem.submenu = buildRecentCallsSubmenu()
+        menu.addItem(callsItem)
+
         // --- Dictation Section ---
         menu.addItem(.separator())
 
@@ -209,6 +214,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let dictationItem = addMenuItem(menu, dictationTitle, #selector(toggleDictation))
         dictationItem.state = settings.dictationEnabled ? .on : .off
+
+        let dictHistoryItem = NSMenuItem(title: "Dictation History", action: nil, keyEquivalent: "")
+        dictHistoryItem.submenu = buildDictationHistorySubmenu()
+        menu.addItem(dictHistoryItem)
 
         // --- Screen Memory Section ---
         menu.addItem(.separator())
@@ -376,6 +385,117 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openWhisperSetup() {
         WhisperSetupWindowController.shared.show()
+    }
+
+    // MARK: - Recent Calls
+
+    private func buildRecentCallsSubmenu() -> NSMenu {
+        let submenu = NSMenu()
+        let sessions = CallHistory.recentSessions(outputPath: settings.outputPath, limit: 20)
+        guard !sessions.isEmpty else {
+            let empty = NSMenuItem(title: "No calls yet", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            submenu.addItem(empty)
+            return submenu
+        }
+
+        for session in sessions {
+            let item = NSMenuItem(title: callDisplayName(session), action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+
+            if let url = session.videoURL {
+                addOpenItem(sub, "🎬 Video", url)
+            }
+            if let url = session.transcriptURL {
+                addOpenItem(sub, "📝 Transcript", url)
+            } else {
+                let pending = NSMenuItem(title: "📝 Transcript (pending…)", action: nil, keyEquivalent: "")
+                pending.isEnabled = false
+                sub.addItem(pending)
+            }
+            if let url = session.summaryURL { addOpenItem(sub, "📋 Summary", url) }
+            if let url = session.followupURL { addOpenItem(sub, "✉️ Follow-up", url) }
+            if let url = session.micURL { addOpenItem(sub, "🎙 Audio — me (mic)", url) }
+            if let url = session.systemURL { addOpenItem(sub, "🔊 Audio — other side", url) }
+
+            sub.addItem(.separator())
+            let reveal = NSMenuItem(title: "Show in Finder", action: #selector(revealCallInFinder(_:)), keyEquivalent: "")
+            reveal.target = self
+            reveal.representedObject = session.videoURL ?? session.transcriptURL ?? session.micURL ?? session.systemURL
+            sub.addItem(reveal)
+
+            item.submenu = sub
+            submenu.addItem(item)
+        }
+        return submenu
+    }
+
+    private func addOpenItem(_ menu: NSMenu, _ title: String, _ url: URL) {
+        let item = NSMenuItem(title: title, action: #selector(openFileURL(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = url
+        menu.addItem(item)
+    }
+
+    private func callDisplayName(_ session: CallSession) -> String {
+        let f = DateFormatter()
+        f.dateFormat = Calendar.current.isDateInToday(session.date) ? "HH:mm" : "dd.MM HH:mm"
+        let when = session.date == .distantPast ? session.tag : f.string(from: session.date)
+        let kind = session.videoURL != nil ? "🎬" : "🎙"
+        return "\(kind) \(when)"
+    }
+
+    @objc private func openFileURL(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func revealCallInFinder(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else {
+            NSWorkspace.shared.open(URL(fileURLWithPath: settings.outputPath))
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    // MARK: - Dictation History
+
+    private func buildDictationHistorySubmenu() -> NSMenu {
+        let submenu = NSMenu()
+        let entries = dictation?.history.recentEntries ?? []
+        guard !entries.isEmpty else {
+            let empty = NSMenuItem(title: "Empty", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            submenu.addItem(empty)
+            return submenu
+        }
+
+        let mainFont = NSFont.menuFont(ofSize: 13)
+        let dimAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.menuFont(ofSize: 11),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        for (i, entry) in entries.prefix(50).enumerated() {
+            let preview = String(entry.text.replacingOccurrences(of: "\n", with: " ").prefix(60))
+            let item = NSMenuItem(title: "", action: #selector(dictationItemClicked(_:)), keyEquivalent: "")
+            let str = NSMutableAttributedString()
+            str.append(NSAttributedString(string: "\(preview)  ", attributes: [.font: mainFont]))
+            str.append(NSAttributedString(string: formatTime(entry.timestamp), attributes: dimAttrs))
+            item.attributedTitle = str
+            item.toolTip = String(entry.text.prefix(500))
+            item.target = self
+            item.tag = i
+            submenu.addItem(item)
+        }
+        return submenu
+    }
+
+    @objc private func dictationItemClicked(_ sender: NSMenuItem) {
+        let entries = dictation?.history.recentEntries ?? []
+        guard sender.tag < entries.count else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(entries[sender.tag].text, forType: .string)
     }
 
     @objc private func toggleDictation() {
