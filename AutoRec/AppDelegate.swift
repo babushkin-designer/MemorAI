@@ -506,7 +506,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let untitled = CallHistory.recentSessions(outputPath: outputPath, limit: 100)
                 .filter { $0.transcriptURL != nil && $0.title == nil }
             var done = 0
-            for session in untitled {
+            for (i, session) in untitled.enumerated() {
+                // Bluesminds free tier rate-limits aggressively (429 after a
+                // few requests/min) — pace the batch instead of blasting it.
+                if i > 0 { Thread.sleep(forTimeInterval: 12) }
                 if CallLLM.generateTitle(for: session) { done += 1 }
             }
             log("[CallLLM] Title backfill: \(done)/\(untitled.count) generated")
