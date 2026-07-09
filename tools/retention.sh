@@ -6,7 +6,10 @@
 # ones are pruned.
 set -e
 RETENTION_DAYS="${RETENTION_DAYS:-14}"
-DIR_BASE="${MEMORAI_DIR:-$(defaults read com.local.memorai outputPath 2>/dev/null)}"
+# `|| true`: with set -e, a failing command substitution in an assignment
+# aborts the script — and `defaults read` exits 1 when outputPath is unset
+# (the common case: default location in use).
+DIR_BASE="${MEMORAI_DIR:-$(defaults read com.local.memorai outputPath 2>/dev/null || true)}"
 [ -z "$DIR_BASE" ] && DIR_BASE="$HOME/Downloads/MemorAI"
 DIR="$DIR_BASE/screen"
 LOG="$DIR_BASE/memorai.log"
