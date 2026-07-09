@@ -18,5 +18,11 @@ let package = Package(
                 .linkedFramework("UniformTypeIdentifiers"),
             ]
         ),
+        .testTarget(
+            name: "MemorAITests",
+            dependencies: ["MemorAI"],
+            path: "Tests/MemorAITests"
+        ),
     ]
 )
+// Run tests: swift test

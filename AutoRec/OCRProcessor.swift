@@ -154,14 +154,14 @@ class OCRProcessor {
 
     // MARK: - Structured Extraction
 
-    private struct ExtractedData {
+    struct ExtractedData {
         var urls: [String] = []
         var emails: [String] = []
         var phones: [String] = []
         var paths: [String] = []
     }
 
-    private static func extractStructuredData(from text: String) -> ExtractedData {
+    static func extractStructuredData(from text: String) -> ExtractedData {
         var result = ExtractedData()
 
         // URLs
