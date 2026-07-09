@@ -18,6 +18,30 @@ get_output_path() {
     echo "$path"
 }
 
+# Emit all screenshot records for a day dir as JSON lines (new index.jsonl
+# format plus any legacy per-shot .json files), sorted by timestamp.
+emit_day_records() {
+    local screen_dir="$1"
+    python3 - "$screen_dir" << 'PYEOF'
+import json, sys, glob, os
+d = sys.argv[1]
+records = []
+idx = os.path.join(d, "index.jsonl")
+if os.path.exists(idx):
+    for line in open(idx, encoding="utf-8"):
+        line = line.strip()
+        if not line: continue
+        try: records.append(json.loads(line))
+        except json.JSONDecodeError: pass
+for f in glob.glob(os.path.join(d, "*.json")):
+    try: records.append(json.load(open(f, encoding="utf-8")))
+    except Exception: pass
+records.sort(key=lambda r: r.get("timestamp", ""))
+for r in records:
+    print(json.dumps(r, ensure_ascii=False))
+PYEOF
+}
+
 cmd_status() {
     local output
     output=$(get_output_path)
@@ -66,7 +90,7 @@ cmd_status() {
     local today=$(date +%Y-%m-%d)
     local screen_dir="$output/screen/$today"
     if [ -d "$screen_dir" ]; then
-        local count=$(ls "$screen_dir"/*.json 2>/dev/null | wc -l | tr -d ' ')
+        local count=$(emit_day_records "$screen_dir" | wc -l | tr -d ' ')
         local size=$(du -sh "$screen_dir" 2>/dev/null | cut -f1)
         echo "Screenshots:      $count ($size)"
     else
@@ -97,18 +121,21 @@ cmd_screenshots() {
     fi
 
     echo "=== Screenshots for $day ==="
-    for f in "$screen_dir"/*.json; do
-        [ -f "$f" ] || continue
-        python3 -c "
+    emit_day_records "$screen_dir" | python3 -c "
 import json, sys
-d = json.load(open('$f'))
-ts = d.get('timestamp','')[:19]
-app = d.get('app_name','')
-title = d.get('window_title','')[:50] if d.get('window_title') else ''
-ocr = d.get('ocr_text','')[:80].replace('\n',' ')
-print(f'{ts}  {app:20s}  {title}')
-" 2>/dev/null
-    done
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    ts = d.get('timestamp','')[:19]
+    app = d.get('app_name','')
+    title = d.get('window_title','')[:50] if d.get('window_title') else ''
+    ocr = d.get('ocr_text','')[:80].replace('\n',' ')
+    print(f'{ts}  {app:20s}  {title}')
+"
 }
 
 cmd_clipboard() {
@@ -151,18 +178,22 @@ cmd_ocr() {
     fi
 
     echo "=== OCR Text (last $count from $day) ==="
-    ls "$screen_dir"/*.json 2>/dev/null | tail -n "$count" | while read f; do
-        python3 -c "
-import json
-d = json.load(open('$f'))
-ts = d.get('timestamp','')[:19]
-app = d.get('app_name','')
-ocr = d.get('ocr_text','')[:200]
-print(f'--- {ts} [{app}] ---')
-print(ocr)
-print()
-" 2>/dev/null
-    done
+    emit_day_records "$screen_dir" | tail -n "$count" | python3 -c "
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    ts = d.get('timestamp','')[:19]
+    app = d.get('app_name','')
+    ocr = d.get('ocr_text','')[:200]
+    print(f'--- {ts} [{app}] ---')
+    print(ocr)
+    print()
+"
 }
 
 cmd_set() {
