@@ -9,9 +9,12 @@ enum DictationState {
 }
 
 /// System-wide voice dictation (SuperWhisper replacement):
-/// global hotkey (⌥Space) toggles mic recording; on stop the audio is
+/// tapping the fn key toggles mic recording; on stop the audio is
 /// transcribed with whisper and the text is pasted into the frontmost app
 /// via the clipboard + synthetic Cmd-V (requires Accessibility permission).
+/// A "tap" is fn pressed and released with no other key in between, so
+/// fn-combos (fn+arrows etc.) don't trigger dictation. The system's own
+/// fn-key action (emoji/dictation) must be set to "Do Nothing".
 ///
 /// Transcription goes through a lazily-started whisper-server that keeps the
 /// model loaded between dictations (fast repeat use); the server is shut down
@@ -43,8 +46,9 @@ class DictationManager {
     private let serverIdleShutdown: TimeInterval = 15 * 60
     private let maxRecordingSeconds: TimeInterval = 600
 
-    private var hotKeyRef: EventHotKeyRef?
-    private var eventHandlerRef: EventHandlerRef?
+    private var eventMonitors: [Any] = []
+    private var fnDown = false
+    private var fnUsedAsCombo = false
 
     private var engine: AVAudioEngine?
     private var audioFile: AVAudioFile?
@@ -60,41 +64,63 @@ class DictationManager {
 
     private var language: String { SettingsManager.shared.whisperLanguage }
 
-    // MARK: - Hotkey
+    // MARK: - fn-key monitoring
 
     func enable() {
-        guard hotKeyRef == nil else { return }
+        guard eventMonitors.isEmpty else { return }
 
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
-                                      eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetEventDispatcherTarget(), { _, _, userData -> OSStatus in
-            guard let userData = userData else { return noErr }
-            let manager = Unmanaged<DictationManager>.fromOpaque(userData).takeUnretainedValue()
-            DispatchQueue.main.async { manager.toggle() }
-            return noErr
-        }, 1, &eventType, Unmanaged.passUnretained(self).toOpaque(), &eventHandlerRef)
-
-        let hotKeyID = EventHotKeyID(signature: OSType(0x4D454D41), id: 1) // 'MEMA'
-        let status = RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), hotKeyID,
-                                         GetEventDispatcherTarget(), 0, &hotKeyRef)
-        if status == noErr {
-            log("[Dictation] Hotkey registered (⌥Space)")
-        } else {
-            log("[Dictation] ❌ Hotkey registration failed (status \(status)) — is ⌥Space taken by another app?")
+        if !AXIsProcessTrusted() {
+            log("[Dictation] ⚠️ Accessibility permission missing — global fn monitoring will not receive events")
         }
+
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown],
+                                                           handler: { [weak self] event in
+            self?.handleKeyEvent(event)
+        }) {
+            eventMonitors.append(monitor)
+        }
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown],
+                                                          handler: { [weak self] event in
+            self?.handleKeyEvent(event)
+            return event
+        }) {
+            eventMonitors.append(monitor)
+        }
+        log("[Dictation] fn-key monitor installed (\(eventMonitors.count) monitors)")
     }
 
     func disable() {
-        if let ref = hotKeyRef {
-            UnregisterEventHotKey(ref)
-            hotKeyRef = nil
-        }
-        if let handler = eventHandlerRef {
-            RemoveEventHandler(handler)
-            eventHandlerRef = nil
-        }
+        for monitor in eventMonitors { NSEvent.removeMonitor(monitor) }
+        eventMonitors = []
+        fnDown = false
         if state == .listening { cancelRecording() }
-        log("[Dictation] Hotkey unregistered")
+        log("[Dictation] fn-key monitor removed")
+    }
+
+    /// Toggle on a clean fn tap: fn down → fn up with no other key pressed
+    /// in between. Any keyDown or other modifier while fn is held marks it
+    /// as a combo and suppresses the toggle.
+    private func handleKeyEvent(_ event: NSEvent) {
+        switch event.type {
+        case .flagsChanged:
+            guard event.keyCode == UInt16(kVK_Function) else {
+                if fnDown { fnUsedAsCombo = true }
+                return
+            }
+            if event.modifierFlags.contains(.function) {
+                fnDown = true
+                fnUsedAsCombo = false
+            } else if fnDown {
+                fnDown = false
+                if !fnUsedAsCombo {
+                    DispatchQueue.main.async { [weak self] in self?.toggle() }
+                }
+            }
+        case .keyDown:
+            if fnDown { fnUsedAsCombo = true }
+        default:
+            break
+        }
     }
 
     /// Full teardown for app quit: hotkey, recording, warm server.

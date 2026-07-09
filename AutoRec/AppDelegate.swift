@@ -66,7 +66,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.callDetector.reportSystemAudioUnavailable()
         }
 
-        // --- Dictation (⌥Space) ---
+        // --- Dictation (fn) ---
         dictation = DictationManager()
         dictation.onStateChange = { [weak self] _ in
             guard let self = self else { return }
@@ -203,9 +203,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let dictationTitle: String
         switch dictation?.state ?? .idle {
-        case .listening: dictationTitle = "🎤 Dictation: listening… (⌥Space to stop)"
+        case .listening: dictationTitle = "🎤 Dictation: listening… (fn to stop)"
         case .processing: dictationTitle = "📝 Dictation: transcribing…"
-        case .idle: dictationTitle = "Dictation (⌥Space)"
+        case .idle: dictationTitle = "Dictation (fn)"
         }
         let dictationItem = addMenuItem(menu, dictationTitle, #selector(toggleDictation))
         dictationItem.state = settings.dictationEnabled ? .on : .off
