@@ -18,6 +18,8 @@ get_output_path() {
     echo "$path"
 }
 
+app_running() { pgrep -x "MemorAI" > /dev/null 2>&1; }
+
 # Emit all screenshot records for a day dir as JSON lines (new index.jsonl
 # format plus any legacy per-shot .json files), sorted by timestamp.
 emit_day_records() {
@@ -48,7 +50,7 @@ cmd_status() {
     echo "=== MemorAI Status ==="
 
     # Check if running
-    if pgrep -f "MemorAI" > /dev/null 2>&1; then
+    if app_running; then
         echo "App:              RUNNING"
     else
         echo "App:              NOT RUNNING"
@@ -270,7 +272,7 @@ cmd_exclude() {
 }
 
 cmd_start() {
-    if pgrep -f "MemorAI" > /dev/null 2>&1; then
+    if app_running; then
         echo "MemorAI is already running"
     else
         open "$APP_PATH"
@@ -279,7 +281,20 @@ cmd_start() {
 }
 
 cmd_stop() {
-    pkill -f "MemorAI" 2>/dev/null && echo "MemorAI stopped" || echo "MemorAI is not running"
+    if ! app_running; then
+        echo "MemorAI is not running"
+        return
+    fi
+    # Ask AppKit to quit so applicationShouldTerminate can finalize
+    # in-flight recordings; fall back to SIGTERM if that fails.
+    osascript -e 'tell application id "com.local.memorai" to quit' 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        app_running || { echo "MemorAI stopped"; return; }
+        sleep 1
+    done
+    pkill -x "MemorAI" 2>/dev/null
+    sleep 1
+    app_running && echo "MemorAI did not stop (still running)" || echo "MemorAI stopped (forced)"
 }
 
 cmd_restart() {
