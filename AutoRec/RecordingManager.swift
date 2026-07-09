@@ -22,6 +22,9 @@ class RecordingManager {
     /// `Task` is already in flight (state == .stopping); drained once that
     /// in-flight task finishes finalizing the writers.
     private var pendingStopCompletions: [() -> Void] = []
+    /// The in-flight startup task; stop must await it so a stop issued during
+    /// .starting cannot run before the recorders exist (orphaned-session race).
+    private var startTask: Task<Void, Never>?
 
     // Track current session file URLs for transcription
     private var currentMicURL: URL?
@@ -54,7 +57,7 @@ class RecordingManager {
         self.currentSystemURL = sysURL
         self.currentScreenURL = vidURL
 
-        Task {
+        startTask = Task {
             do {
                 let sysRec = SystemAudioRecorder(audioURL: sysURL, videoURL: vidURL)
                 // Wire up silence / availability / error signals
@@ -131,6 +134,10 @@ class RecordingManager {
         let screenURL = currentScreenURL
 
         Task {
+            // Wait for a still-running startup to finish so we stop real, started
+            // recorders — otherwise stop no-ops on nil/unstarted recorders and the
+            // startup task then brings the session up with nobody left to stop it.
+            await startTask?.value
             micRecorder?.stop()
             await systemAudioRecorder?.stop()
             micRecorder = nil
