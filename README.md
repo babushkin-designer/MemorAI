@@ -2,14 +2,14 @@
 
 Remembers everything you do on your computer for AI.
 
-MemorAI sits in your menu bar and silently captures your digital life — screen activity, clipboard history, and phone calls. Everything stays local on your machine: screenshots are OCR'd via Apple Vision, calls are transcribed via whisper.cpp. The result is a structured, searchable archive of your workday that's ready for AI-powered retrieval.
+MemorAI sits in your menu bar and silently captures your digital life — screen activity, clipboard history, and phone calls. Everything stays local on your machine: screenshots are OCR'd via a local RapidOCR ONNX sidecar, calls are transcribed via whisper.cpp. The result is a structured, searchable archive of your workday that's ready for AI-powered retrieval.
 
 ## Features
 
 ### Screen Memory
 - **Periodic screenshots** — captures screen every N seconds (configurable 1–30s)
 - **Smart change detection** — only saves when something actually changed (perceptual hash)
-- **OCR** — Apple Vision extracts text from every screenshot (Russian + English)
+- **OCR** — a local RapidOCR ONNX Python sidecar extracts text from every screenshot (Russian + English)
 - **Structured extraction** — URLs, emails, phone numbers parsed from OCR text
 - **Metadata** — active app, window title, browser URL saved with each capture
 - **App exclusions** — skip recording for specific apps (Telegram, YouTube, etc.)
@@ -35,7 +35,7 @@ MemorAI sits in your menu bar and silently captures your digital life — screen
 ## Build & Run
 
 ```bash
-cd side-projects/memorAI
+cd MemorAI
 bash bundle.sh
 open MemorAI.app
 ```
@@ -49,6 +49,9 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
 ./memorai screenshots [date]  # list captures for a day
 ./memorai clipboard [count]   # show clipboard history
 ./memorai ocr [date] [count]  # show OCR text from screenshots
+./memorai search <query> [--days N] [--source screen|clipboard|calls|all] [--regex] [--limit N]
+                               # search OCR text, clipboard history, and call transcripts
+                               # e.g. ./memorai search "kickoff" --days 14 --source screen
 ./memorai set <key> <value>   # change settings
 ./memorai exclude add|remove|list  # manage excluded apps
 ./memorai start|stop|restart  # control the app
@@ -74,13 +77,27 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
   clipboard.jsonl                    # clipboard history
   screen/
     2026-03-22/
-      14-30-05.jpg                   # screenshot
-      14-30-05.json                  # {app, window_title, ocr_text, urls, ...}
+      14-30-05.heif                  # screenshot
+      index.jsonl                    # one JSON record per screenshot: {timestamp, image_file, app_name, window_title, ocr_text, urls, ...}
   call_<timestamp>_system.m4a       # system audio
   call_<timestamp>_mic.m4a          # microphone
   call_<timestamp>_screen.mp4       # screen (if enabled)
   call_<timestamp>_transcript.txt   # transcription (if enabled)
 ```
+
+## Retention
+
+Screenshots accumulate quickly, so `tools/retention.sh` deletes screenshot
+*images* (`.jpg`/`.heif`/`.png`) older than 14 days (override with
+`RETENTION_DAYS`). It never deletes OCR text (`index.jsonl`), clipboard
+history, call recordings, or transcripts — those are kept forever. The same
+script also caps `memorai.log`: once it exceeds 10 MB it's truncated in
+place to the last 5 MB (the file's inode is preserved so the running app's
+open log handle stays valid).
+
+Run it once with `memorai retention run`, or schedule it daily at 04:30 via
+a LaunchAgent with `memorai retention install` (`memorai retention status` /
+`memorai retention uninstall` to check or remove it).
 
 ## Transcription Setup
 
@@ -92,6 +109,16 @@ curl -L "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
 ```
 
 For better Russian recognition, use `ggml-medium.bin` instead.
+
+## OCR Setup
+
+```bash
+# find a Homebrew python3 (checked in this order)
+/opt/homebrew/bin/python3 -m pip install rapidocr_onnxruntime || \
+/usr/local/bin/python3 -m pip install rapidocr_onnxruntime
+```
+
+RapidOCR runs as a local Python sidecar (Russian + English); no cloud calls.
 
 ## License
 

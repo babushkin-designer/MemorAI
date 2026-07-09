@@ -18,13 +18,39 @@ get_output_path() {
     echo "$path"
 }
 
+app_running() { pgrep -x "MemorAI" > /dev/null 2>&1; }
+
+# Emit all screenshot records for a day dir as JSON lines (new index.jsonl
+# format plus any legacy per-shot .json files), sorted by timestamp.
+emit_day_records() {
+    local screen_dir="$1"
+    python3 - "$screen_dir" << 'PYEOF'
+import json, sys, glob, os
+d = sys.argv[1]
+records = []
+idx = os.path.join(d, "index.jsonl")
+if os.path.exists(idx):
+    for line in open(idx, encoding="utf-8"):
+        line = line.strip()
+        if not line: continue
+        try: records.append(json.loads(line))
+        except json.JSONDecodeError: pass
+for f in glob.glob(os.path.join(d, "*.json")):
+    try: records.append(json.load(open(f, encoding="utf-8")))
+    except Exception: pass
+records.sort(key=lambda r: r.get("timestamp", ""))
+for r in records:
+    print(json.dumps(r, ensure_ascii=False))
+PYEOF
+}
+
 cmd_status() {
     local output
     output=$(get_output_path)
     echo "=== MemorAI Status ==="
 
     # Check if running
-    if pgrep -f "MemorAI" > /dev/null 2>&1; then
+    if app_running; then
         echo "App:              RUNNING"
     else
         echo "App:              NOT RUNNING"
@@ -66,7 +92,7 @@ cmd_status() {
     local today=$(date +%Y-%m-%d)
     local screen_dir="$output/screen/$today"
     if [ -d "$screen_dir" ]; then
-        local count=$(ls "$screen_dir"/*.json 2>/dev/null | wc -l | tr -d ' ')
+        local count=$(emit_day_records "$screen_dir" | wc -l | tr -d ' ')
         local size=$(du -sh "$screen_dir" 2>/dev/null | cut -f1)
         echo "Screenshots:      $count ($size)"
     else
@@ -97,18 +123,21 @@ cmd_screenshots() {
     fi
 
     echo "=== Screenshots for $day ==="
-    for f in "$screen_dir"/*.json; do
-        [ -f "$f" ] || continue
-        python3 -c "
+    emit_day_records "$screen_dir" | python3 -c "
 import json, sys
-d = json.load(open('$f'))
-ts = d.get('timestamp','')[:19]
-app = d.get('app_name','')
-title = d.get('window_title','')[:50] if d.get('window_title') else ''
-ocr = d.get('ocr_text','')[:80].replace('\n',' ')
-print(f'{ts}  {app:20s}  {title}')
-" 2>/dev/null
-    done
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    ts = d.get('timestamp','')[:19]
+    app = d.get('app_name','')
+    title = d.get('window_title','')[:50] if d.get('window_title') else ''
+    ocr = d.get('ocr_text','')[:80].replace('\n',' ')
+    print(f'{ts}  {app:20s}  {title}')
+"
 }
 
 cmd_clipboard() {
@@ -151,18 +180,22 @@ cmd_ocr() {
     fi
 
     echo "=== OCR Text (last $count from $day) ==="
-    ls "$screen_dir"/*.json 2>/dev/null | tail -n "$count" | while read f; do
-        python3 -c "
-import json
-d = json.load(open('$f'))
-ts = d.get('timestamp','')[:19]
-app = d.get('app_name','')
-ocr = d.get('ocr_text','')[:200]
-print(f'--- {ts} [{app}] ---')
-print(ocr)
-print()
-" 2>/dev/null
-    done
+    emit_day_records "$screen_dir" | tail -n "$count" | python3 -c "
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    ts = d.get('timestamp','')[:19]
+    app = d.get('app_name','')
+    ocr = d.get('ocr_text','')[:200]
+    print(f'--- {ts} [{app}] ---')
+    print(ocr)
+    print()
+"
 }
 
 cmd_set() {
@@ -239,7 +272,7 @@ cmd_exclude() {
 }
 
 cmd_start() {
-    if pgrep -f "MemorAI" > /dev/null 2>&1; then
+    if app_running; then
         echo "MemorAI is already running"
     else
         open "$APP_PATH"
@@ -248,13 +281,218 @@ cmd_start() {
 }
 
 cmd_stop() {
-    pkill -f "MemorAI" 2>/dev/null && echo "MemorAI stopped" || echo "MemorAI is not running"
+    if ! app_running; then
+        echo "MemorAI is not running"
+        return
+    fi
+    # Ask AppKit to quit so applicationShouldTerminate can finalize
+    # in-flight recordings; fall back to SIGTERM if that fails.
+    osascript -e 'tell application id "com.local.memorai" to quit' 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        app_running || { echo "MemorAI stopped"; return; }
+        sleep 1
+    done
+    pkill -x "MemorAI" 2>/dev/null
+    sleep 1
+    app_running && echo "MemorAI did not stop (still running)" || echo "MemorAI stopped (forced)"
 }
 
 cmd_restart() {
     cmd_stop
     sleep 1
     cmd_start
+}
+
+cmd_search() {
+    local query="$1"; shift
+    if [ -z "$query" ]; then
+        echo "Usage: memorai search <query> [--days N] [--source screen|clipboard|calls|all] [--regex] [--limit N]" >&2
+        return 1
+    fi
+    local days=7 source=all regex=0 limit=50
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --days)   days="$2"; shift 2 ;;
+            --source) source="$2"; shift 2 ;;
+            --regex)  regex=1; shift ;;
+            --limit)  limit="$2"; shift 2 ;;
+            *) echo "Unknown flag: $1" >&2; return 1 ;;
+        esac
+    done
+    local output
+    output=$(get_output_path)
+    local day_list="" i
+    for i in $(seq 0 $((days - 1))); do
+        day_list="$day_list $(date -v-${i}d +%Y-%m-%d)"
+    done
+    MEMORAI_QUERY="$query" MEMORAI_REGEX="$regex" MEMORAI_LIMIT="$limit" \
+    MEMORAI_SOURCE="$source" MEMORAI_OUTPUT="$output" MEMORAI_DAYS="$day_list" \
+    python3 << 'PYEOF'
+import json, os, re, sys, glob
+
+query = os.environ.get("MEMORAI_QUERY", "")
+use_regex = os.environ.get("MEMORAI_REGEX") == "1"
+limit = int(os.environ.get("MEMORAI_LIMIT", "50"))
+source = os.environ.get("MEMORAI_SOURCE", "all")
+output = os.environ.get("MEMORAI_OUTPUT", "")
+days = set(os.environ.get("MEMORAI_DAYS", "").split())
+
+pattern = None
+if use_regex:
+    try:
+        pattern = re.compile(query, re.IGNORECASE)
+    except re.error as e:
+        print(f"invalid regex: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def find_match(text):
+    t = text.replace("\n", " ")
+    if use_regex:
+        m = pattern.search(t)
+        if m:
+            return m.start(), m.end(), t
+        return None
+    idx = t.lower().find(query.lower())
+    if idx >= 0:
+        return idx, idx + len(query), t
+    return None
+
+def context(s, e, t, width=60):
+    half = max(0, (width - (e - s)) // 2)
+    start = max(0, s - half)
+    end = min(len(t), start + width)
+    start = max(0, end - width)
+    return t[start:end].strip()
+
+hits = []  # (sort_key, display_line)
+
+def emit_day_records_py(screen_dir):
+    records = []
+    idx = os.path.join(screen_dir, "index.jsonl")
+    if os.path.exists(idx):
+        for line in open(idx, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    for f in glob.glob(os.path.join(screen_dir, "*.json")):
+        try:
+            records.append(json.load(open(f, encoding="utf-8")))
+        except Exception:
+            pass
+    return records
+
+if source in ("screen", "all"):
+    for day in days:
+        screen_dir = os.path.join(output, "screen", day)
+        if not os.path.isdir(screen_dir):
+            continue
+        for r in emit_day_records_py(screen_dir):
+            ts = r.get("timestamp", "")
+            app = r.get("app_name", "")
+            for field in ("ocr_text", "window_title", "url", "app_name"):
+                val = r.get(field)
+                if not val:
+                    continue
+                m = find_match(str(val))
+                if m:
+                    ctx = context(*m)
+                    hits.append((ts, f"{ts}  [screen]   {app} — {ctx}"))
+                    break
+
+if source in ("clipboard", "all"):
+    clip_file = os.path.join(output, "clipboard.jsonl")
+    if os.path.exists(clip_file):
+        for line in open(clip_file, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = r.get("timestamp", "")
+            if ts[:10] not in days:
+                continue
+            app = r.get("app_name", "")
+            for field in ("content", "app_name"):
+                val = r.get(field)
+                if not val:
+                    continue
+                m = find_match(str(val))
+                if m:
+                    ctx = context(*m)
+                    hits.append((ts, f"{ts}  [clip]     {app} — {ctx}"))
+                    break
+
+if source in ("calls", "all"):
+    for f in sorted(glob.glob(os.path.join(output, "call_*_transcript.txt"))):
+        base = os.path.basename(f)
+        m = re.match(r"call_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_transcript\.txt", base)
+        if not m:
+            continue
+        date_part, time_part = m.group(1), m.group(2)
+        if date_part not in days:
+            continue
+        ts = f"{date_part}T{time_part.replace('-', ':')}"
+        try:
+            lines = open(f, encoding="utf-8").readlines()
+        except Exception:
+            continue
+        for line in lines:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            mm = find_match(line)
+            if mm:
+                hits.append((ts, f"{date_part}            [call]     {base}: {line[:80]}"))
+
+hits.sort(key=lambda h: h[0], reverse=True)
+hits = hits[:limit]
+
+if not hits:
+    print("no matches")
+    sys.exit(0)
+
+for _, line in hits:
+    print(line)
+PYEOF
+}
+
+cmd_retention() {
+    local action="${1:-run}"
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    local retention_sh="$script_dir/tools/retention.sh"
+
+    case "$action" in
+        run)
+            bash "$retention_sh"
+            ;;
+        install)
+            local plist_src="$script_dir/tools/com.local.memorai.retention.plist"
+            local target="$HOME/Library/LaunchAgents/com.local.memorai.retention.plist"
+            sed "s|__RETENTION_SH__|$retention_sh|" "$plist_src" > "$target"
+            launchctl bootstrap "gui/$(id -u)" "$target" 2>/dev/null || launchctl load "$target"
+            echo "Installed: runs daily at 04:30"
+            ;;
+        uninstall)
+            local target="$HOME/Library/LaunchAgents/com.local.memorai.retention.plist"
+            launchctl bootout "gui/$(id -u)" "$target" 2>/dev/null || launchctl unload "$target" 2>/dev/null || true
+            rm -f "$target"
+            echo "Uninstalled"
+            ;;
+        status)
+            launchctl list | grep com.local.memorai.retention || echo "not installed"
+            ;;
+        *)
+            echo "Usage: memorai retention <run|install|uninstall|status>"
+            return 1
+            ;;
+    esac
 }
 
 cmd_help() {
@@ -273,6 +511,10 @@ Commands:
   clipboard [count]         Show clipboard history (default: last 20)
   ocr [date] [count]        Show OCR text from screenshots
 
+  search <query> [--days N] [--source screen|clipboard|calls|all] [--regex] [--limit N]
+    Search OCR text, clipboard history, and call transcripts.
+    Defaults: --days 7, --source all, substring match (case-insensitive), --limit 50
+
   set <key> <value>         Change a setting
     screen-memory true/false
     clipboard true/false
@@ -282,6 +524,11 @@ Commands:
   exclude add <bundle-id>   Add app to exclusion list
   exclude remove <bundle-id>  Remove app from exclusion list
   exclude list              List excluded apps
+
+  retention run             Run the retention/log-cap script now
+  retention install         Install the daily LaunchAgent (04:30)
+  retention uninstall       Remove the LaunchAgent
+  retention status          Show whether the LaunchAgent is loaded
 
   help                      Show this help
 EOF
@@ -296,8 +543,10 @@ case "${1:-help}" in
     screenshots)  cmd_screenshots "$2" ;;
     clipboard)    cmd_clipboard "$2" ;;
     ocr)          cmd_ocr "$2" "$3" ;;
+    search)       shift; cmd_search "$@" ;;
     set)          cmd_set "$2" "$3" ;;
     exclude)      cmd_exclude "$2" "$3" ;;
+    retention)    cmd_retention "$2" ;;
     help|--help|-h) cmd_help ;;
     *)            echo "Unknown command: $1"; cmd_help ;;
 esac
