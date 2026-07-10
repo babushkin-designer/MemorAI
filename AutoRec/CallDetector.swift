@@ -9,9 +9,11 @@ import Darwin
 /// + `kAudioProcessPropertyIsRunningInput` + `kAudioProcessPropertyPID`. We filter out our
 /// own PID, so our MicRecorder's AVAudioEngine does not mask call-end.
 ///
-/// Silence-based signals (system audio, mic RMS) are kept as informational callbacks but no
-/// longer drive call-end decisions — a call app releases its own mic when the meeting ends,
-/// while ambient room noise through our mic engine can keep RMS above threshold indefinitely.
+/// Call-end is primarily mic-release driven — a call app releases its own mic when the
+/// meeting ends, while ambient room noise through our mic engine can keep RMS above
+/// threshold indefinitely. One exception (see shouldStayInCall): while recording, a free
+/// mic with ACTIVE system audio means the user muted themselves in the call app (Electron
+/// apps release the mic on mute) — the call ends only once system audio goes silent too.
 class CallDetector {
     var onCallStarted: (() -> Void)?
     var onCallEnded: (() -> Void)?
@@ -118,10 +120,30 @@ class CallDetector {
         }
 
         if callActive && inactiveCount >= debounceCount {
+            // Muted-in-call-app case: Electron call apps (Pachca, Zoom web…)
+            // fully release the mic while the user is muted, but the meeting
+            // is still on — the far side keeps producing system audio. While
+            // recording, treat "mic free but system audio active" as still
+            // in-call; the call only ends once system audio has also been
+            // silent for its threshold (or was never available).
+            if Self.shouldStayInCall(recordingMode: recordingMode,
+                                     systemAudioAvailable: systemAudioAvailable,
+                                     systemAudioSilent: systemAudioSilent) {
+                if inactiveCount == debounceCount {
+                    log("[CallDetector] Mic released but system audio still active (muted in call app?) — keeping recording")
+                }
+                return
+            }
             callActive = false
             log("[CallDetector] \(recordingMode ? "No other process holds mic" : "Mic released") — call ended")
             onCallEnded?()
         }
+    }
+
+    /// Pure decision: mic is free, should we still consider the call active?
+    static func shouldStayInCall(recordingMode: Bool, systemAudioAvailable: Bool,
+                                 systemAudioSilent: Bool) -> Bool {
+        recordingMode && systemAudioAvailable && !systemAudioSilent
     }
 
     // MARK: - Per-process CoreAudio query
