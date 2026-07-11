@@ -192,16 +192,40 @@ class CallDetector {
         return holders
     }
 
+    /// System binaries that ARE calls despite living under /System or /usr/libexec:
+    /// FaceTime routes the mic through the avconferenced daemon, not the app process.
+    private static let callDaemonMarkers = [
+        "avconferenced",     // FaceTime / SharePlay conference daemon
+        "FaceTime.app",      // just in case the app ever holds the mic itself
+        "callservicesd",     // continuity phone calls relayed to the Mac
+    ]
+
     /// Returns false for system daemons (corespeechd, assistantd, coreaudiod, etc.) that
     /// hold the mic for background OS features like Siri / dictation and should never be
-    /// treated as call activity. Anything shipping from /System or /usr/libexec qualifies.
+    /// treated as call activity. Anything shipping from /System or /usr/libexec qualifies —
+    /// except the known call daemons above (FaceTime has no user-space mic holder at all).
     private func isUserFacingProcess(pid: pid_t) -> Bool {
         guard let path = executablePath(pid: pid) else { return false }
-        if path.hasPrefix("/System/") { return false }
-        if path.hasPrefix("/usr/libexec/") { return false }
-        if path.hasPrefix("/usr/sbin/") { return false }
-        if path.hasPrefix("/usr/bin/") { return false }
+        if Self.isKnownCallDaemon(path) { return true }
+        if path.hasPrefix("/System/") { return logFiltered(path) }
+        if path.hasPrefix("/usr/libexec/") { return logFiltered(path) }
+        if path.hasPrefix("/usr/sbin/") { return logFiltered(path) }
+        if path.hasPrefix("/usr/bin/") { return logFiltered(path) }
         return true
+    }
+
+    static func isKnownCallDaemon(_ path: String) -> Bool {
+        callDaemonMarkers.contains { path.contains($0) }
+    }
+
+    /// Diagnostics: log each distinct filtered mic-holder once per app run, so an
+    /// undetected call app can be identified from memorai.log instead of guessed at.
+    private var loggedFilteredPaths = Set<String>()
+    private func logFiltered(_ path: String) -> Bool {
+        if loggedFilteredPaths.insert(path).inserted {
+            log("[CallDetector] Ignoring system mic holder: \(path)")
+        }
+        return false
     }
 
     private func executablePath(pid: pid_t) -> String? {

@@ -21,6 +21,13 @@ final class CallDetectorTests: XCTestCase {
             recordingMode: true, systemAudioAvailable: false, systemAudioSilent: false))
     }
 
+    func testFaceTimeDaemonIsCallDespiteSystemPath() {
+        XCTAssertTrue(CallDetector.isKnownCallDaemon("/usr/libexec/avconferenced"))
+        XCTAssertTrue(CallDetector.isKnownCallDaemon("/System/Applications/FaceTime.app/Contents/MacOS/FaceTime"))
+        XCTAssertFalse(CallDetector.isKnownCallDaemon("/System/Library/PrivateFrameworks/Siri.framework/corespeechd"))
+        XCTAssertFalse(CallDetector.isKnownCallDaemon("/usr/libexec/assistantd"))
+    }
+
     func testOutsideRecordingModeUnchanged() {
         XCTAssertFalse(CallDetector.shouldStayInCall(
             recordingMode: false, systemAudioAvailable: true, systemAudioSilent: false))
