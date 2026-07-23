@@ -234,7 +234,8 @@ class Transcriber {
                   let to = offsets["to"] as? Int,
                   let text = item["text"] as? String else { continue }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, !isNonSpeechAnnotation(trimmed) else { continue }
+            guard !trimmed.isEmpty, !isNonSpeechAnnotation(trimmed),
+                  !isHallucinatedSegment(trimmed) else { continue }
             segments.append(TranscriptSegment(fromMs: from + offsetMs, toMs: to + offsetMs, text: trimmed))
         }
         return segments
@@ -247,6 +248,72 @@ class Transcriber {
             if text.first == open && text.last == close { return true }
         }
         return false
+    }
+
+    // MARK: - Hallucination filter
+
+    /// Stock outro phrases whisper hallucinates on trailing silence: the model
+    /// was trained on subtitled video, so silence decodes into typical subtitle
+    /// endings. Matched against a WHOLE segment/line only (after
+    /// normalization), so real sentences containing these words survive.
+    static let hallucinationPhrases: Set<String> = [
+        "продолжение следует",
+        "спасибо за просмотр",
+        "до новых встреч",
+        "to be continued",
+        "thanks for watching",
+        "thank you for watching",
+    ]
+
+    /// Subtitle-credit hallucinations ("Субтитры сделал DimaTorzok", "Редактор
+    /// субтитров А.Синецкая…") — matched as prefixes of a normalized segment.
+    static let hallucinationPrefixes: [String] = [
+        "субтитры сделал",
+        "субтитры создавал",
+        "субтитры делал",
+        "субтитры сделаны",
+        "субтитры подготов",
+        "редактор субтитров",
+        "subtitles by",
+    ]
+
+    private static let hallucinationTrimSet =
+        CharacterSet(charactersIn: " \t\n.,!?…-–—:;\"'«»()[]")
+
+    static func normalizedHallucinationText(_ text: String) -> String {
+        text.lowercased().trimmingCharacters(in: hallucinationTrimSet)
+    }
+
+    /// True when the entire segment/line is a known whisper hallucination.
+    static func isHallucinatedSegment(_ text: String) -> Bool {
+        let norm = normalizedHallucinationText(text)
+        guard !norm.isEmpty else { return false }
+        if hallucinationPhrases.contains(norm) { return true }
+        if hallucinationPrefixes.contains(where: { norm.hasPrefix($0) }) { return true }
+        if norm.contains("dimatorzok") || norm.contains("amara.org") { return true }
+        return false
+    }
+
+    /// Strip hallucinated outro phrases off the END of flat text. Needed for
+    /// dictation, where whisper-server returns one line and a per-line whole-
+    /// match can't catch "…я закончил мысль. Продолжение следует...".
+    static func stripTrailingHallucinations(_ text: String) -> String {
+        let alternatives = hallucinationPhrases
+            .map { NSRegularExpression.escapedPattern(for: $0) }
+            .joined(separator: "|")
+        guard let re = try? NSRegularExpression(
+            pattern: "(?:^|\\s)(?:\(alternatives))[\\s.,!?…]*$",
+            options: [.caseInsensitive]) else { return text }
+
+        var result = text
+        // A few passes: outros can stack ("…следует... Спасибо за просмотр!").
+        for _ in 0..<3 {
+            let range = NSRange(result.startIndex..., in: result)
+            guard let m = re.firstMatch(in: result, range: range),
+                  let r = Range(m.range, in: result) else { break }
+            result = String(result[..<r.lowerBound])
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Interleave mic ("Я") and system ("Собеседник") segments by start time into
@@ -408,7 +475,11 @@ class Transcriber {
     /// Remove hallucination loops: exact duplicates and near-duplicate runs.
     func deduplicateTranscript(at url: URL) {
         guard let content = try? String(contentsOf: url, encoding: .utf8) else { return }
-        let lines = content.components(separatedBy: "\n")
+        let rawLines = content.components(separatedBy: "\n")
+
+        // Pass 0: drop whole-line subtitle outros ("Продолжение следует...")
+        // — covers the merged-mix path where segments aren't parsed as JSON.
+        let lines = rawLines.filter { !Self.isHallucinatedSegment($0) }
 
         // Pass 1: collapse exact consecutive duplicates
         var deduped: [String] = []
@@ -452,7 +523,7 @@ class Transcriber {
         let cleaned = result.joined(separator: "\n")
         try? cleaned.write(to: url, atomically: true, encoding: .utf8)
 
-        let removed = lines.count - result.count
+        let removed = rawLines.count - result.count
         if removed > 0 {
             log("[Transcriber] Dedup: removed \(removed) hallucinated lines")
         }

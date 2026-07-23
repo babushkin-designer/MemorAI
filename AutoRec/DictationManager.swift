@@ -266,13 +266,16 @@ class DictationManager {
     }
 
     /// Flatten whisper output into paste-ready text: strip non-speech
-    /// annotations, join lines into a single space-separated string.
+    /// annotations and hallucinated subtitle outros, join lines into a
+    /// single space-separated string.
     static func cleanDictationText(_ raw: String) -> String {
         let parts = raw
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && !Transcriber.isNonSpeechAnnotation($0) }
-        return parts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty && !Transcriber.isNonSpeechAnnotation($0)
+                      && !Transcriber.isHallucinatedSegment($0) }
+        let joined = parts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return Transcriber.stripTrailingHallucinations(joined)
     }
 
     // MARK: - whisper-server lifecycle
@@ -303,6 +306,8 @@ class DictationManager {
             "-m", modelFile, "-l", lang,
             "--host", "127.0.0.1", "--port", String(serverPort),
             "-t", "4", "-sns",
+            // Same anti-hallucination decoder thresholds as the call path.
+            "-et", "2.2", "-lpt", "-0.5",
         ]
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
@@ -423,6 +428,7 @@ class DictationManager {
 
         let result = runProcess(whisperExec, args: [
             "-m", modelFile, "-l", lang, "-sns",
+            "-et", "2.2", "-lpt", "-0.5",
             "-otxt", "-of", outBase.path, wavURL.path,
         ], timeout: 300)
         guard result.exitCode == 0 else {
