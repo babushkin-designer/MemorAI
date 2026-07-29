@@ -15,6 +15,15 @@ class MicRecorder {
     var isPaused = false
     private let outputURL: URL
 
+    /// Host-clock time (seconds, same clock as SCStream PTS) of the first
+    /// recorded buffer — lets AudioMuxer align this track with system audio.
+    private(set) var firstBufferHostSeconds: Double?
+    /// True while the running engine has Apple voice processing (AEC) active.
+    private var voiceProcessingActive = false
+    /// Set once voice processing failed on this machine/session; further
+    /// engine (re)starts skip it instead of failing the whole recording.
+    private var voiceProcessingUnavailable = false
+
     private var lastBufferTime: Date?
     private var watchdogTimer: Timer?
     private let watchdogInterval: TimeInterval = 5.0
@@ -51,8 +60,37 @@ class MicRecorder {
     }
 
     private func startEngine() throws {
+        let wantVP = SettingsManager.shared.micEchoCancellation && !voiceProcessingUnavailable
+        if wantVP {
+            do {
+                try startEngine(withVoiceProcessing: true)
+                return
+            } catch {
+                voiceProcessingUnavailable = true
+                log("[MicRecorder] ⚠️ Voice processing failed (\(error.localizedDescription)) — falling back to raw mic")
+                // The file (if any) was created for the VP format; recreate for raw.
+                if bufferCount == 0 { audioFile = nil }
+            }
+        }
+        try startEngine(withVoiceProcessing: false)
+    }
+
+    private func startEngine(withVoiceProcessing useVP: Bool) throws {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
+
+        // Acoustic echo cancellation: without it, on speakerless setups the
+        // far side's voice leaks from the speakers into the mic and the muxed
+        // video plays every remote phrase twice (~130 ms apart — audible echo).
+        if useVP {
+            try inputNode.setVoiceProcessingEnabled(true)
+            // Don't let VP duck the user's actual call audio while we record.
+            inputNode.voiceProcessingOtherAudioDuckingConfiguration =
+                AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                    enableAdvancedDucking: false, duckingLevel: .min)
+        }
+        voiceProcessingActive = useVP
+
         let recordingFormat = inputNode.outputFormat(forBus: 0)
 
         guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
@@ -67,6 +105,19 @@ class MicRecorder {
         // sample rate and channel count, so writing in native format is reliable.
         let nativeSampleRate = recordingFormat.sampleRate
         let nativeChannels = recordingFormat.channelCount
+
+        // An engine restart can come up in a different format (device switch,
+        // VP→raw fallback). A still-empty file can simply be recreated; a file
+        // with audio in it can't change format mid-stream.
+        if let file = audioFile,
+           file.processingFormat.sampleRate != nativeSampleRate
+            || file.processingFormat.channelCount != nativeChannels {
+            if bufferCount == 0 {
+                audioFile = nil
+            } else {
+                log("[MicRecorder] ⚠️ Input format changed mid-recording (file \(Int(file.processingFormat.sampleRate))Hz/\(file.processingFormat.channelCount)ch vs input \(Int(nativeSampleRate))Hz/\(nativeChannels)ch) — writes may fail")
+            }
+        }
 
         if audioFile == nil {
             let fileSettings: [String: Any] = [
@@ -83,10 +134,15 @@ class MicRecorder {
             )
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, when in
             guard let self = self, self.isRecording, !self.isPaused else { return }
             self.lastBufferTime = Date()
             self.bufferCount &+= 1
+            if self.firstBufferHostSeconds == nil, when.isHostTimeValid {
+                let hostSeconds = AVAudioTime.seconds(forHostTime: when.hostTime)
+                self.firstBufferHostSeconds = hostSeconds
+                log("[MicRecorder] First buffer at host time \(String(format: "%.3f", hostSeconds))s")
+            }
 
             do {
                 try self.audioFile?.write(from: buffer)
@@ -106,7 +162,7 @@ class MicRecorder {
         self.engine = engine
         self.lastBufferTime = Date()
 
-        log("[MicRecorder] Engine started: \(Int(nativeSampleRate))Hz/\(nativeChannels)ch (native, no resampling)")
+        log("[MicRecorder] Engine started: \(Int(nativeSampleRate))Hz/\(nativeChannels)ch (native, no resampling), echo cancellation \(useVP ? "ON" : "off")")
     }
 
     private func installConfigChangeObserver() {
@@ -145,6 +201,12 @@ class MicRecorder {
         guard isRecording, !isPaused, let last = lastBufferTime else { return }
         let stalled = Date().timeIntervalSince(last)
         if stalled > maxStallSeconds {
+            // A VP engine that delivers no buffers means voice processing is
+            // broken on this system (beta-OS territory) — restart without it.
+            if voiceProcessingActive && bufferCount == 0 {
+                voiceProcessingUnavailable = true
+                log("[MicRecorder] ⚠️ Voice-processing engine produced no buffers — disabling echo cancellation")
+            }
             log("[MicRecorder] ⚠️ No buffers for \(Int(stalled))s (total \(bufferCount) buffers) — restarting engine")
             handleConfigChange()
         }

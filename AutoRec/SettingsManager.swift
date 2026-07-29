@@ -39,6 +39,17 @@ class SettingsManager {
         set { defaults.set(newValue, forKey: "autoTranscribe") }
     }
 
+    /// Acoustic echo cancellation on the call mic (Apple voice processing).
+    /// Strips speaker playback from the mic track so speakerless calls don't
+    /// end up with the far side recorded twice (mic leak + system audio).
+    var micEchoCancellation: Bool {
+        get {
+            if defaults.object(forKey: "micEchoCancellation") == nil { return true }
+            return defaults.bool(forKey: "micEchoCancellation")
+        }
+        set { defaults.set(newValue, forKey: "micEchoCancellation") }
+    }
+
     /// Whisper language code: "ru", "en", "auto", etc. Default "ru".
     var whisperLanguage: String {
         get { defaults.string(forKey: "whisperLanguage") ?? "ru" }

@@ -3,6 +3,12 @@ import Foundation
 /// Replaces the video-only screen.mp4 in-place with a copy that has both mic and
 /// system audio mixed in. Originals (mic.m4a, system.m4a) are left untouched —
 /// Transcriber consumes them after, and they're useful for re-mixing later.
+///
+/// The three files start at different wall-clock moments (SCStream comes up
+/// before the mic engine; the video session opens on the first captured frame),
+/// so each audio track is shifted onto the video's timeline before mixing.
+/// Without this, audio that reaches both tracks (speaker leak into the mic on
+/// headphone-less calls) played twice ~130 ms apart — an audible echo.
 class AudioMuxer {
     static let shared = AudioMuxer()
 
@@ -15,14 +21,102 @@ class AudioMuxer {
 
     private let queue = DispatchQueue(label: "com.local.memorai.audiomux", qos: .utility)
 
-    func muxScreenWithAudio(screenURL: URL, micURL: URL?, systemURL: URL?, completion: (() -> Void)? = nil) {
+    /// Track start times are host-clock seconds (mic: first tap buffer,
+    /// system/video: first sample PTS); nil means unknown → track is not shifted.
+    func muxScreenWithAudio(screenURL: URL, micURL: URL?, systemURL: URL?,
+                            micStartSeconds: Double? = nil,
+                            systemStartSeconds: Double? = nil,
+                            videoStartSeconds: Double? = nil,
+                            completion: (() -> Void)? = nil) {
         queue.async { [self] in
-            mux(screenURL: screenURL, micURL: micURL, systemURL: systemURL)
+            mux(screenURL: screenURL, micURL: micURL, systemURL: systemURL,
+                micStartSeconds: micStartSeconds, systemStartSeconds: systemStartSeconds,
+                videoStartSeconds: videoStartSeconds)
             completion?()
         }
     }
 
-    private func mux(screenURL: URL, micURL: URL?, systemURL: URL?) {
+    /// Per-track shift (seconds) onto the video timeline. Positive = the track
+    /// started later than the reference and gets delayed; negative = it started
+    /// earlier and its head gets trimmed. Falls back to the earliest audio
+    /// track as reference when the video start is unknown.
+    static func computeOffsets(micStart: Double?, systemStart: Double?,
+                               videoStart: Double?) -> (mic: Double, system: Double) {
+        let audioStarts = [micStart, systemStart].compactMap { $0 }
+        guard let reference = videoStart ?? audioStarts.min() else { return (0, 0) }
+        func offset(_ start: Double?) -> Double {
+            guard let start = start else { return 0 }
+            let off = start - reference
+            // A huge offset means a clock/PTS anomaly — better to mix unshifted
+            // than to delay or silence a big chunk of the track.
+            return abs(off) <= 10 ? off : 0
+        }
+        return (offset(micStart), offset(systemStart))
+    }
+
+    /// Pure ffmpeg argument builder. Input order: 0 = video, then mic, then
+    /// system (whichever exist). Caller guarantees at least one audio path.
+    static func buildMuxArgs(screenPath: String, micPath: String?, sysPath: String?,
+                             micOffset: Double, sysOffset: Double,
+                             outPath: String) -> [String] {
+        var inputs: [(path: String, offset: Double)] = []
+        if let micPath = micPath { inputs.append((micPath, micOffset)) }
+        if let sysPath = sysPath { inputs.append((sysPath, sysOffset)) }
+
+        // -v error keeps stderr bounded — it's read only after exit, and a
+        // chatty ffmpeg could otherwise fill the pipe buffer and deadlock.
+        var args: [String] = ["-y", "-v", "error", "-i", screenPath]
+        for input in inputs { args.append(contentsOf: ["-i", input.path]) }
+
+        func shiftOps(_ offset: Double) -> String? {
+            if offset > 0.001 {
+                return "adelay=\(Int((offset * 1000).rounded())):all=1"
+            }
+            if offset < -0.001 {
+                return String(format: "atrim=start=%.3f,asetpts=PTS-STARTPTS", -offset)
+            }
+            return nil
+        }
+
+        var filterParts: [String] = []
+        var pads: [String] = []
+        for (i, input) in inputs.enumerated() {
+            let src = "[\(i + 1):a]"
+            if let ops = shiftOps(input.offset) {
+                filterParts.append("\(src)\(ops)[t\(i)]")
+                pads.append("[t\(i)]")
+            } else {
+                pads.append(src)
+            }
+        }
+
+        let audioMap: String
+        if pads.count == 2 {
+            filterParts.append("\(pads[0])\(pads[1])amix=inputs=2:duration=longest:dropout_transition=0[a]")
+            audioMap = "[a]"
+        } else if filterParts.isEmpty {
+            audioMap = "1:a"
+        } else {
+            audioMap = pads[0]
+        }
+
+        if !filterParts.isEmpty {
+            args.append(contentsOf: ["-filter_complex", filterParts.joined(separator: ";")])
+        }
+        args.append(contentsOf: [
+            "-map", "0:v",
+            "-map", audioMap,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            outPath,
+        ])
+        return args
+    }
+
+    private func mux(screenURL: URL, micURL: URL?, systemURL: URL?,
+                     micStartSeconds: Double?, systemStartSeconds: Double?,
+                     videoStartSeconds: Double?) {
         guard FileManager.default.fileExists(atPath: screenURL.path) else {
             log("[AudioMuxer] Screen file missing — skipping")
             return
@@ -38,38 +132,20 @@ class AudioMuxer {
         let tempURL = screenURL.deletingPathExtension().appendingPathExtension("muxing.mp4")
         try? FileManager.default.removeItem(at: tempURL)
 
-        // Input order: 0 = video (no audio), 1+ = audio sources in the order added.
-        var args: [String] = ["-y", "-i", screenURL.path]
-        if micExists { args.append(contentsOf: ["-i", micURL!.path]) }
-        if sysExists { args.append(contentsOf: ["-i", systemURL!.path]) }
-
-        let micIdx = 1
-        let sysIdx = micExists ? 2 : 1
-        let audioMap: String
-        if micExists && sysExists {
-            args.append(contentsOf: [
-                "-filter_complex",
-                "[\(micIdx):a][\(sysIdx):a]amix=inputs=2:duration=longest:dropout_transition=0[a]"
-            ])
-            audioMap = "[a]"
-        } else if micExists {
-            audioMap = "\(micIdx):a"
-        } else {
-            audioMap = "\(sysIdx):a"
-        }
-
-        args.append(contentsOf: [
-            "-map", "0:v",
-            "-map", audioMap,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            tempURL.path,
-        ])
+        let offsets = Self.computeOffsets(micStart: micExists ? micStartSeconds : nil,
+                                          systemStart: sysExists ? systemStartSeconds : nil,
+                                          videoStart: videoStartSeconds)
+        let args = Self.buildMuxArgs(screenPath: screenURL.path,
+                                     micPath: micExists ? micURL!.path : nil,
+                                     sysPath: sysExists ? systemURL!.path : nil,
+                                     micOffset: offsets.mic,
+                                     sysOffset: offsets.system,
+                                     outPath: tempURL.path)
 
         let sources = [micExists ? "mic" : nil, sysExists ? "system" : nil]
             .compactMap { $0 }.joined(separator: "+")
-        log("[AudioMuxer] Muxing \(sources) → \(screenURL.lastPathComponent)")
+        log(String(format: "[AudioMuxer] Muxing %@ → %@ (offsets mic %+.3fs, system %+.3fs)",
+                   sources, screenURL.lastPathComponent, offsets.mic, offsets.system))
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: ffmpegPath)

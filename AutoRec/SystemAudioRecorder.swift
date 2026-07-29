@@ -32,6 +32,12 @@ class SystemAudioRecorder: NSObject {
     private var isRecording = false
     var isPaused = false
 
+    /// Host-clock times (seconds) of the first written audio buffer / video
+    /// frame — the zero points of the .m4a and .mp4 timelines. AudioMuxer uses
+    /// them to align mic and system audio with the video.
+    private(set) var audioFirstPTSSeconds: Double?
+    private(set) var videoFirstPTSSeconds: Double?
+
     // --- Silence detection ---
     /// Fires when system audio transitions to/from silence.
     /// `true` = silent for silenceDurationThreshold, `false` = audio resumed.
@@ -282,6 +288,7 @@ extension SystemAudioRecorder: SCStreamOutput {
                 let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
                 audioWriter?.startSession(atSourceTime: pts)
                 audioSessionStarted = true
+                audioFirstPTSSeconds = CMTimeGetSeconds(pts)
                 if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
                    let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
                     log("[SystemAudioRecorder] Audio format: \(asbd.pointee.mSampleRate)Hz, \(asbd.pointee.mChannelsPerFrame)ch, \(asbd.pointee.mBitsPerChannel)bit")
@@ -333,6 +340,7 @@ extension SystemAudioRecorder: SCStreamOutput {
                 let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
                 videoWriter?.startSession(atSourceTime: pts)
                 videoSessionStarted = true
+                videoFirstPTSSeconds = CMTimeGetSeconds(pts)
                 log("[SystemAudioRecorder] Video session started")
             }
 

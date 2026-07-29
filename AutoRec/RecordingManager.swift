@@ -140,6 +140,11 @@ class RecordingManager {
             await startTask?.value
             micRecorder?.stop()
             await systemAudioRecorder?.stop()
+            // Track start times (host clock) — AudioMuxer aligns the three
+            // files with these; grab them before the recorders are released.
+            let micStart = micRecorder?.firstBufferHostSeconds
+            let sysStart = systemAudioRecorder?.audioFirstPTSSeconds
+            let vidStart = systemAudioRecorder?.videoFirstPTSSeconds
             micRecorder = nil
             systemAudioRecorder = nil
             setState(.idle)
@@ -156,7 +161,10 @@ class RecordingManager {
             // Mux mic + system audio into screen.mp4 in-place so the video file is
             // self-contained for downstream playback. Runs in parallel with transcription.
             if let screenURL = screenURL {
-                AudioMuxer.shared.muxScreenWithAudio(screenURL: screenURL, micURL: micURL, systemURL: sysURL)
+                AudioMuxer.shared.muxScreenWithAudio(screenURL: screenURL, micURL: micURL, systemURL: sysURL,
+                                                     micStartSeconds: micStart,
+                                                     systemStartSeconds: sysStart,
+                                                     videoStartSeconds: vidStart)
             }
 
             // Auto-transcribe if enabled and whisper is available
