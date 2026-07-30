@@ -13,6 +13,9 @@ class OCRProcessor {
 
     // Candidate interpreters that may have rapidocr_onnxruntime installed.
     private static let pythonCandidates = [
+        // Dedicated venv on a uv-managed standalone CPython: survives Homebrew
+        // python major bumps, which wipe brew site-packages.
+        NSString(string: "~/.local/share/memorai-ocr/venv/bin/python").expandingTildeInPath,
         "/opt/homebrew/bin/python3",  // Apple Silicon Homebrew
         "/usr/local/bin/python3",     // Intel Homebrew
     ]
