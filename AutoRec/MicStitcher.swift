@@ -115,10 +115,21 @@ class MicStitcher {
         return args
     }
 
+    /// Segments with audio in them that are still on disk.
+    private func usableSegments(_ segments: [MicRecorder.Segment]) -> [MicRecorder.Segment] {
+        segments.filter { !$0.isEmpty && FileManager.default.fileExists(atPath: $0.url.path) }
+    }
+
     /// True when a lone segment is already the finished track in the output
     /// format and only needs its canonical name — no transcode, no ffmpeg.
+    /// The quit path checks this: a rename is bounded work, a transcode is not.
+    func canPublishByRename(segments: [MicRecorder.Segment], outputURL: URL) -> Bool {
+        Self.isReadyToPublish(usableSegments(segments), outputURL: outputURL)
+    }
+
     static func isReadyToPublish(_ segments: [MicRecorder.Segment], outputURL: URL) -> Bool {
         segments.count == 1
+            && segments[0].url != outputURL
             && segments[0].url.pathExtension.lowercased() == outputURL.pathExtension.lowercased()
     }
 
@@ -128,7 +139,7 @@ class MicStitcher {
     /// file stays absent rather than holding a fraction of the call.
     @discardableResult
     func stitch(segments: [MicRecorder.Segment], outputURL: URL) -> Bool {
-        let usable = segments.filter { !$0.isEmpty && FileManager.default.fileExists(atPath: $0.url.path) }
+        let usable = usableSegments(segments)
         guard !usable.isEmpty else { return false }
         // A lone segment already sitting at the destination is the whole track.
         guard usable.count > 1 || usable[0].url != outputURL else { return true }

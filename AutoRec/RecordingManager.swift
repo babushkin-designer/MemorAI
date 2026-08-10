@@ -30,8 +30,31 @@ class RecordingManager {
     private var currentMicURL: URL?
     private var currentSystemURL: URL?
     private var currentScreenURL: URL?
+    /// The on-disk record of the session in progress. Written before the
+    /// recorders start, so even a session killed mid-call leaves something the
+    /// next launch can finish.
+    private var currentManifest: CallSessionManifest?
+    private var currentBaseDir: URL?
 
-    private(set) var isTranscribing = false
+    /// Owned by PostProcessor now — post-processing outlives a recording (and,
+    /// across a manifest, the process itself).
+    var isTranscribing: Bool { PostProcessor.shared.isTranscribing }
+
+    init() {
+        PostProcessor.shared.onTranscribingChanged = { [weak self] _ in
+            guard let self = self else { return }
+            self.onStateChange?(self.state)
+        }
+        PostProcessor.shared.onTranscriptionDone = { [weak self] in
+            self?.onTranscriptionDone?()
+        }
+    }
+
+    /// Finishes any session left half-processed by a previous run. Call once,
+    /// at launch, after the callbacks above are wired.
+    func resumeUnfinishedSessions() {
+        PostProcessor.shared.resumePending(in: URL(fileURLWithPath: settings.outputPath))
+    }
 
     func startRecording(source: String = "manual") {
         guard state == .idle else {
@@ -56,6 +79,14 @@ class RecordingManager {
         self.currentMicURL = micURL
         self.currentSystemURL = sysURL
         self.currentScreenURL = vidURL
+        self.currentBaseDir = baseDir
+
+        var manifest = CallSessionManifest(tag: timestamp)
+        manifest.micFile = micURL.lastPathComponent
+        manifest.systemFile = sysURL.lastPathComponent
+        manifest.screenFile = vidURL?.lastPathComponent
+        manifest.save(in: baseDir)
+        self.currentManifest = manifest
 
         startTask = Task {
             do {
@@ -99,6 +130,9 @@ class RecordingManager {
                 micRecorder?.stop()
                 systemAudioRecorder = nil
                 micRecorder = nil
+                // Nothing was recorded, so there is nothing to post-process.
+                if let dir = currentBaseDir { currentManifest?.remove(in: dir) }
+                currentManifest = nil
                 setState(.idle)
                 onRecordingActiveChanged?(false)
             }
@@ -139,8 +173,7 @@ class RecordingManager {
         setState(.stopping)
 
         let micURL = currentMicURL
-        let sysURL = currentSystemURL
-        let screenURL = currentScreenURL
+        let baseDir = currentBaseDir ?? URL(fileURLWithPath: settings.outputPath)
 
         Task {
             // Wait for a still-running startup to finish so we stop real, started
@@ -164,19 +197,32 @@ class RecordingManager {
             onRecordingActiveChanged?(false)
             log("[RecordingManager] All recorders stopped")
 
-            // Before the completion fires: on app-quit that callback is what
-            // replies to applicationShouldTerminate, so anything left after it
-            // races the process exit.
-            //
-            // The mic is recorded into part files and only becomes
-            // call_<tag>_mic.m4a here. A failure is a failure: the canonical
-            // file stays absent, the parts stay on disk, and the muxer and the
-            // transcriber run without a mic track instead of being handed the
-            // first fragment of the call as if it were the whole thing.
-            if let micURL = micURL, !micSegments.isEmpty,
-               !MicStitcher.shared.stitch(segments: micSegments, outputURL: micURL) {
-                log("[RecordingManager] ❌ Mic track not assembled — \(micURL.lastPathComponent) is missing, parts kept: \(micSegments.map { $0.url.lastPathComponent }.joined(separator: ", "))")
+            // The timings above live only in the recorders; write them down
+            // before anything else can go wrong, or a session interrupted
+            // later can never be aligned again.
+            var manifest = currentManifest ?? CallSessionManifest(tag: Self.tag(of: micURL))
+            manifest.micStartSeconds = micStart
+            manifest.systemStartSeconds = sysStart
+            manifest.videoStartSeconds = vidStart
+            manifest.segments = micSegments.map(CallSessionManifest.record)
+            manifest.recordingFinished = true
+
+            // The mic is recorded into part files and becomes
+            // call_<tag>_mic.m4a only once the whole track is there. A lone
+            // segment in the output format is published by renaming it, which
+            // is bounded work and safe to do before the completion below — on
+            // app-quit that callback is what lets the process exit. Anything
+            // needing ffmpeg is left to the pipeline, which resumes at the next
+            // launch if this process does not live long enough to finish it.
+            if micSegments.isEmpty {
+                manifest.stages.micPublished = true      // the mic never produced audio
+            } else if let micURL = micURL,
+                      MicStitcher.shared.canPublishByRename(segments: micSegments, outputURL: micURL) {
+                manifest.stages.micPublished =
+                    MicStitcher.shared.stitch(segments: micSegments, outputURL: micURL)
             }
+            manifest.save(in: baseDir)
+            currentManifest = nil
 
             completion?()
             let queued = pendingStopCompletions
@@ -185,46 +231,18 @@ class RecordingManager {
                 DispatchQueue.main.async { pending() }
             }
 
-            // Strip the far side's speaker leak out of the mic track. Runs here,
-            // after the UI is idle and the quit completion has fired, because a
-            // long call takes minutes to process; the raw mic is left untouched
-            // and used as-is if anything about the result looks wrong.
-            var effectiveMicURL = micURL
-            if let micURL = micURL, let sysURL = sysURL,
-               EchoCanceller.shared.isAvailable {
-                effectiveMicURL = EchoCanceller.shared.process(micURL: micURL, systemURL: sysURL) ?? micURL
-            }
-
-            // Mux mic + system audio into screen.mp4 in-place so the video file is
-            // self-contained for downstream playback. Runs in parallel with transcription.
-            if let screenURL = screenURL {
-                AudioMuxer.shared.muxScreenWithAudio(screenURL: screenURL, micURL: effectiveMicURL, systemURL: sysURL,
-                                                     micStartSeconds: micStart,
-                                                     systemStartSeconds: sysStart,
-                                                     videoStartSeconds: vidStart)
-            }
-
-            // Auto-transcribe if enabled and whisper is available
-            if settings.autoTranscribe {
-                guard Transcriber.shared.isAvailable else {
-                    log("[RecordingManager] Auto-transcribe on but whisper/model missing — skipping")
-                    return
-                }
-                isTranscribing = true
-                onStateChange?(state) // trigger UI update
-                log("[RecordingManager] Starting transcription…")
-                // Transcribe the cleaned mic but keep naming the session after
-                // the canonical file, or the transcript lands next to it under
-                // a mangled name.
-                Transcriber.shared.transcribeSession(micURL: effectiveMicURL, systemURL: sysURL,
-                                                     namingURL: micURL) { [weak self] in
-                    self?.isTranscribing = false
-                    self?.onTranscriptionDone?()
-                    self?.onStateChange?(self?.state ?? .idle)
-                    log("[RecordingManager] Transcription complete")
-                }
-            }
+            // Echo cancellation, muxing and transcription take minutes on a
+            // long call — far longer than a quit may be held up. They run in
+            // PostProcessor, off the manifest, and survive the app going away.
+            PostProcessor.shared.enqueue(manifest, in: baseDir)
         }
+    }
+
+    /// Fallback tag when a stop somehow runs without the manifest from start.
+    private static func tag(of micURL: URL?) -> String {
+        guard let name = micURL?.lastPathComponent,
+              let parsed = CallHistory.parse(filename: name) else { return timestamp() }
+        return parsed.tag
     }
 
     private func setState(_ newState: RecordingState) {

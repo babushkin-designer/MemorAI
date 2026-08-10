@@ -29,11 +29,24 @@ class AudioMuxer {
                             videoStartSeconds: Double? = nil,
                             completion: (() -> Void)? = nil) {
         queue.async { [self] in
-            mux(screenURL: screenURL, micURL: micURL, systemURL: systemURL,
-                micStartSeconds: micStartSeconds, systemStartSeconds: systemStartSeconds,
-                videoStartSeconds: videoStartSeconds)
+            _ = mux(screenURL: screenURL, micURL: micURL, systemURL: systemURL,
+                    micStartSeconds: micStartSeconds, systemStartSeconds: systemStartSeconds,
+                    videoStartSeconds: videoStartSeconds)
             completion?()
         }
+    }
+
+    /// Same job, run on the caller's thread. The post-processing pipeline is
+    /// already on a background queue and needs each stage's verdict before it
+    /// records progress, so it calls this directly. Returns false when the
+    /// video was left as it was.
+    @discardableResult
+    func muxNow(screenURL: URL, micURL: URL?, systemURL: URL?,
+                micStartSeconds: Double?, systemStartSeconds: Double?,
+                videoStartSeconds: Double?) -> Bool {
+        mux(screenURL: screenURL, micURL: micURL, systemURL: systemURL,
+            micStartSeconds: micStartSeconds, systemStartSeconds: systemStartSeconds,
+            videoStartSeconds: videoStartSeconds)
     }
 
     /// Per-track shift (seconds) onto the video timeline. Positive = the track
@@ -116,17 +129,17 @@ class AudioMuxer {
 
     private func mux(screenURL: URL, micURL: URL?, systemURL: URL?,
                      micStartSeconds: Double?, systemStartSeconds: Double?,
-                     videoStartSeconds: Double?) {
+                     videoStartSeconds: Double?) -> Bool {
         guard FileManager.default.fileExists(atPath: screenURL.path) else {
             log("[AudioMuxer] Screen file missing — skipping")
-            return
+            return false
         }
 
         let micExists = micURL.flatMap { FileManager.default.fileExists(atPath: $0.path) } ?? false
         let sysExists = systemURL.flatMap { FileManager.default.fileExists(atPath: $0.path) } ?? false
         guard micExists || sysExists else {
             log("[AudioMuxer] No audio sources — skipping screen mux")
-            return
+            return false
         }
 
         let tempURL = screenURL.deletingPathExtension().appendingPathExtension("muxing.mp4")
@@ -155,15 +168,17 @@ class AudioMuxer {
             let why = result.timedOut ? "timed out" : "exit \(result.exitCode)"
             log("[AudioMuxer] ❌ ffmpeg failed (\(why)): \(result.stderrTail)")
             try? FileManager.default.removeItem(at: tempURL)
-            return
+            return false
         }
 
         do {
             _ = try FileManager.default.replaceItemAt(screenURL, withItemAt: tempURL)
             log("[AudioMuxer] ✅ Audio muxed into \(screenURL.lastPathComponent)")
+            return true
         } catch {
             log("[AudioMuxer] ❌ Replace failed: \(error.localizedDescription)")
             try? FileManager.default.removeItem(at: tempURL)
+            return false
         }
     }
 }

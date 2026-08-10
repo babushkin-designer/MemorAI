@@ -18,13 +18,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return .terminateNow
         }
         log("[AppDelegate] Terminate requested during recording — finalizing first")
+        var replied = false
+        // Only the writers are waited on here — closing the m4a/mp4 files is
+        // what cannot be redone later. Echo cancellation, muxing and
+        // transcription take minutes; they are recorded in the session's
+        // manifest and resumed at the next launch instead of racing the exit.
         recordingManager.stopRecording(source: "app-quit") {
             DispatchQueue.main.async {
+                replied = true
                 NSApp.reply(toApplicationShouldTerminate: true)
             }
         }
         // Failsafe: never hang quit for more than 10s.
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            if !replied {
+                log("[AppDelegate] ⚠️ Recorders did not finalize within 10s — quitting anyway")
+            }
             NSApp.reply(toApplicationShouldTerminate: true)  // no-op if already replied
         }
         return .terminateLater
@@ -68,6 +77,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordingManager.onTranscriptionDone = { [weak self] in
             self?.autoTitleLatestCall()
         }
+        // Post-processing outlives the app: a quit (or a crash) mid-pipeline
+        // leaves the session's manifest on disk, and this is what finishes it.
+        recordingManager.resumeUnfinishedSessions()
 
         // --- Dictation (fn) ---
         dictation = DictationManager()
