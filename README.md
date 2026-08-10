@@ -71,8 +71,16 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
 
 ## Data Structure
 
+The data directory is whatever `defaults read com.local.memorai outputPath`
+says; when that key is unset the app falls back to `~/Downloads/MemorAI/`.
+Pick a location that survives your housekeeping — Downloads is a folder most
+people periodically empty. Changing it: `defaults write com.local.memorai
+outputPath -string <path>`, then quit and relaunch the app (a running app
+keeps writing to the old path, and moving the folder alone does nothing —
+the app just recreates the old one).
+
 ```
-~/Downloads/MemorAI/
+<outputPath>/                        # e.g. ~/Documents/MemorAI/
   memorai.log                        # app log
   clipboard.jsonl                    # clipboard history
   screen/
@@ -98,8 +106,9 @@ open log handle stays valid).
 The app runs this policy itself once a day (see
 `AutoRec/RetentionManager.swift`) — no scheduling setup is needed. A
 LaunchAgent can NOT do this job on modern macOS: TCC denies `/bin/bash`
-under launchd access to `~/Downloads`, so `memorai retention install` is
-kept only for data dirs outside TCC-protected folders. For a manual pass
+under launchd access to protected folders like `~/Downloads` and
+`~/Documents`, so `memorai retention install` is kept only for data dirs
+outside them. For a manual pass
 from a terminal, run `memorai retention run`.
 
 ## Transcription Setup

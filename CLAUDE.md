@@ -31,8 +31,10 @@ personal fork; do not push to any remote.
 
 ## Data (runtime, NOT in the repo)
 
-`~/Downloads/MemorAI/` by default (`defaults read com.local.memorai
-outputPath` overrides): `screen/YYYY-MM-DD/HH-mm-ss.heif` +
+Location comes from `defaults read com.local.memorai outputPath`; the
+built-in fallback when that key is unset is `~/Downloads/MemorAI/`. On this
+machine the key IS set, to `~/Documents/MemorAI/` — always read the pref, do
+not assume the fallback. Contents: `screen/YYYY-MM-DD/HH-mm-ss.heif` +
 per-day `index.jsonl` (one JSON record per screenshot; legacy per-shot
 `HH-mm-ss.json` files exist in old day dirs — read both),
 `clipboard.jsonl`, `call_*_{system,mic}.m4a`, `call_*_screen.mp4`,

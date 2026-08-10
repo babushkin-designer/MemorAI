@@ -1,7 +1,8 @@
 import Foundation
 
 /// Daily data hygiene, run in-process. A launchd LaunchAgent can't do this
-/// job: TCC denies ~/Downloads access to /bin/bash under launchd, while the
+/// job: TCC denies /bin/bash under launchd access to the protected folders
+/// the data dir lives in (~/Downloads, ~/Documents), while the
 /// app itself already reads and writes its own data dir all day.
 ///
 /// Policy (mirrors tools/retention.sh, which remains for manual runs from a

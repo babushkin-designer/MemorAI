@@ -99,9 +99,11 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   `Transcriber.swift:283`), which is by design.
 - Default output dir `~/Downloads/MemorAI` for sensitive data: arguably too
   exposed (any app with Downloads access can read it), but it is a deliberate,
-  documented choice (README:72) and user-configurable — flagged here, not
-  planned. Consider `~/Library/Application Support` as default in a future
-  major version.
+  documented choice and user-configurable — flagged here, not planned.
+  Consider `~/Library/Application Support` as default in a future major
+  version. **2026-08-07:** sidestepped in practice — this machine's
+  `outputPath` now points at `~/Documents/MemorAI` (Downloads was too easy to
+  wipe by accident); the code default is unchanged.
 
 ## Not audited
 
