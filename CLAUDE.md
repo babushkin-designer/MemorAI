@@ -8,21 +8,28 @@ personal fork; do not push to any remote.
 ## Build / verify
 
 - `swift build` — the primary gate (repo root). ~10 s warm.
-- `swift test` — only if the test target exists (see plans/006).
+- `swift test` — 124 tests; must stay offline and must never touch the real
+  data dir (fixture dirs only). ffmpeg/AEC-dependent tests skip themselves
+  where those are not installed.
 - `bash bundle.sh` — builds MemorAI.app and codesigns it (stable identity so
   macOS TCC permissions survive rebuilds). Needed only to run the GUI.
+  Deploy: `bash bundle.sh` then `ditto MemorAI.app /Applications/MemorAI.app`
+  — NOT install.sh, which ad-hoc signs and resets TCC.
 - CLI checks: `bash -n memorai`.
 
 ## Layout
 
 - `AutoRec/` — all Swift sources (single executable target `MemorAI`).
   Key files: AppDelegate (menu bar UI + lifecycle), RecordingManager
-  (start/stop state machine), SystemAudioRecorder (SCStream: system audio +
-  screen), MicRecorder (AVAudioEngine), CallDetector (CoreAudio per-process
-  mic usage), ScreenMemoryManager (screenshot loop), OCRProcessor (RapidOCR
-  Python sidecar — `ocr_sidecar.py`), Transcriber (ffmpeg + whisper-cli
-  subprocesses), ClipboardMonitor, SettingsManager (UserDefaults,
-  domain `com.local.memorai`), Logger (global `log()` → memorai.log).
+  (start/stop state machine, `@MainActor`), SystemAudioRecorder (SCStream:
+  system audio + screen), MicRecorder (AVAudioEngine), CallDetector (CoreAudio
+  per-process mic usage), PostProcessor + CallSessionManifest (everything after
+  the recorders stop), MicStitcher (joins mic segments), EchoCanceller
+  (`aec_sidecar.py`), AudioMuxer, ScreenMemoryManager (screenshot loop),
+  OCRProcessor (RapidOCR Python sidecar — `ocr_sidecar.py`), Transcriber
+  (ffmpeg + whisper-cli subprocesses), ClipboardMonitor, SettingsManager
+  (UserDefaults, domain `com.local.memorai`), Logger (global `log()` →
+  memorai.log).
 - `memorai` — bash CLI over the app's data and defaults.
 - `tools/` — retention/maintenance scripts.
 - `plans/` — advisor-written implementation plans; read `plans/README.md`
@@ -39,6 +46,42 @@ per-day `index.jsonl` (one JSON record per screenshot; legacy per-shot
 `HH-mm-ss.json` files exist in old day dirs — read both),
 `clipboard.jsonl`, `call_*_{system,mic}.m4a`, `call_*_screen.mp4`,
 `call_*_transcript.txt`, `memorai.log`.
+
+Work files live in the same folder and are NOT recordings: `_mic.part<N>.m4a`
+/ `.caf` (segments awaiting the stitcher), `_mic.stitching.m4a`,
+`_screen.muxing.mp4` (ffmpeg temporaries), `_session.json` (the post-processing
+manifest, present only while a session is unfinished). `_mic.aec.m4a` IS data —
+the echo-cancelled mic, kept next to the raw one.
+
+## Call pipeline
+
+Recording: SystemAudioRecorder writes `_system.m4a` + `_screen.mp4`;
+MicRecorder writes `_mic.part<N>` segments (a new one on every engine restart —
+device switches change the format, and a file's format is fixed when opened).
+
+Post-processing (PostProcessor, off a `_session.json` manifest written at
+start): publish `_mic.m4a` from the segments → EchoCanceller → AudioMuxer →
+Transcriber. Each stage is idempotent and recorded as it completes, so quitting
+or crashing mid-pipeline only costs the stage in flight; the next launch calls
+`resumeUnfinishedSessions()` and finishes the rest. Quit waits for the writers
+only — never for ffmpeg or whisper.
+
+Invariants worth not breaking:
+- `call_<tag>_mic.m4a` appears only when it holds the WHOLE track. A failed
+  stitch leaves it absent and the parts on disk; downstream then honestly runs
+  without a mic track.
+- Track alignment comes from host-clock starts (`AudioMuxer.computeOffsets`),
+  used by both the muxer and the speaker-labeled transcript.
+- MicRecorder's tap runs on the audio thread: shared state is `_`-prefixed and
+  guarded by `UnfairLock`, and the tap NEVER tears anything down — it posts one
+  main-queue event and the main queue owns the engine.
+- Echo cancellation is OFFLINE only. Apple voice processing reconfigures the
+  shared input device for every app on the machine and degraded a real meeting;
+  the live path was removed on purpose, do not bring it back.
+- EchoCanceller thresholds in `verdict` are set from measurements on real calls
+  (voice −0.07 dB at 0.997 correlation, 9–25 dB of echo removed) — do not
+  retune them without new measurements. The sidecar aligns the tracks itself by
+  cross-correlation; unaligned input drops cancellation from 24.7 dB to 0.7.
 
 ## Sharp edges
 
