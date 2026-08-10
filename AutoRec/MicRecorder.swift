@@ -9,6 +9,21 @@ import ObjCTry
 /// - Listens to AVAudioEngineConfigurationChange (route changes kill the engine silently otherwise).
 /// - Watchdog: if no audio buffer arrives for >10s while we expect to be recording, restart the engine.
 /// - All lifecycle and error events go through the shared `log()` so they land in memorai.log.
+///
+/// THREADING. Two parties touch this object:
+///   * the tap block, on Core Audio's real-time thread;
+///   * start/stop, the pause switch, the watchdog and the config-change
+///     handler, all on the main queue.
+/// Every field both parties touch lives behind `lock` and is spelled with a
+/// leading underscore, so an unguarded access is visible at the call site.
+/// The engine itself (and its observer/timer) belongs to the main queue alone.
+///
+/// The tap NEVER tears anything down. It records what happened, releases the
+/// lock and posts a single main-queue event; the main queue owns the engine
+/// lifecycle and RecordingManager owns the session. Calling `stop()` from
+/// inside the tap — which is what the write-error path used to do — reenters
+/// the engine from its own callback, and `removeTap` waits for that callback
+/// to return.
 class MicRecorder {
     /// One continuous stretch of mic audio written in a single audio format.
     /// A mid-call input-device switch ends the current segment and opens the
@@ -25,70 +40,93 @@ class MicRecorder {
         var isEmpty: Bool { frameCount <= 0 }
     }
 
+    private let outputURL: URL
+    private let lock = UnfairLock()
+
+    // MARK: - Main queue only (the engine and its supervision)
+
     private var engine: AVAudioEngine?
-    private var audioFile: AVAudioFile?
-    private var isRecording = false
+    private var watchdogTimer: Timer?
+    private let watchdogInterval: TimeInterval = 5.0
+    private let maxStallSeconds: TimeInterval = 10.0
+    private var configChangeObserver: NSObjectProtocol?
+    /// True between a config-change notification and the debounced engine
+    /// restart it schedules.
+    private var restartPending = false
+    private let configChangeDebounce: TimeInterval = 0.5
+
+    // MARK: - Shared state (lock)
+
+    private var _audioFile: AVAudioFile?
+    private var _isRecording = false
+    private var _isPaused = false
+    /// Closed segments in recording order. Populated as the recording goes and
+    /// completed by `stop()`.
+    private var _segments: [Segment] = []
+    private var _currentSegmentIndex = 1
+    private var _currentSegmentFirstHost: Double?
+    private var _currentSegmentURL: URL
+    private var _pausedAt: Date?
+    /// Silence owed to the file for time spent paused, written on the next
+    /// buffer. Not written when the recording stops while still paused — the
+    /// system recorder's file ends at the pause too, so both tracks end
+    /// together and adding silence there would be the drift, not the fix.
+    private var _pendingSilenceSeconds: TimeInterval = 0
+    /// Host-clock time (seconds, same clock as SCStream PTS) of the first
+    /// recorded buffer — lets AudioMuxer align this track with system audio.
+    private var _firstBufferHostSeconds: Double?
+    private var _lastBufferTime: Date?
+    private var _bufferCount: UInt64 = 0
+    private var _writeErrorCount = 0
+    /// Set once the tap has asked for recovery, so a tap that keeps failing
+    /// posts exactly one event instead of one per buffer.
+    private var _recoveryRequested = false
+    private var _silenceStart: Date?
+    private var _isSilent = false
+
+    private let maxWriteErrors = 5
+
+    // MARK: - Callbacks
+
+    /// Fires on transitions: true = mic silent for silenceDurationThreshold, false = voice resumed.
+    var onSilenceChanged: ((Bool) -> Void)?
+    /// The mic is down and cannot be brought back. Fired once, on the main
+    /// queue, after this recorder has finalized its own files. RecordingManager
+    /// ends the session on it: leaving the manager in `.recording` with a dead
+    /// mic kept the system track rolling into a session nobody would finish.
+    var onFatalError: (() -> Void)?
+
+    // MARK: - Accessors
+
+    /// Closed segments, safe to read once `stop()` has returned.
+    var segments: [Segment] { lock.withLock { _segments } }
+    var firstBufferHostSeconds: Double? { lock.withLock { _firstBufferHostSeconds } }
+
     /// Pausing drops tap buffers, so paused wall-clock time is simply missing
     /// from the mic file. The system recorder does NOT compress the same way:
     /// it appends its buffers with their original PTS, so its writer keeps the
     /// gap in the timeline. Without putting that time back as silence the two
     /// tracks drift apart by the length of every pause — and the transcript
     /// interleaves them by timestamp.
-    var isPaused = false {
-        didSet {
-            guard isPaused != oldValue else { return }
-            if isPaused {
-                pausedAt = Date()
-            } else if let pausedAt = pausedAt {
-                pendingSilenceSeconds += Date().timeIntervalSince(pausedAt)
-                self.pausedAt = nil
+    var isPaused: Bool {
+        get { lock.withLock { _isPaused } }
+        set {
+            lock.withLock {
+                guard newValue != _isPaused else { return }
+                _isPaused = newValue
+                if newValue {
+                    _pausedAt = Date()
+                } else if let pausedAt = _pausedAt {
+                    _pendingSilenceSeconds += Date().timeIntervalSince(pausedAt)
+                    _pausedAt = nil
+                }
             }
         }
     }
-    private let outputURL: URL
-
-    /// Closed segments in recording order; the first one is always `outputURL`.
-    /// Populated as the recording goes and completed by `stop()`.
-    private(set) var segments: [Segment] = []
-    private var currentSegmentIndex = 1
-    private var currentSegmentFirstHost: Double?
-    private var currentSegmentURL: URL
-    private var pausedAt: Date?
-    /// Silence owed to the file for time spent paused, written on the next
-    /// buffer. Not written when the recording stops while still paused — the
-    /// system recorder's file ends at the pause too, so both tracks end
-    /// together and adding silence there would be the drift, not the fix.
-    private var pendingSilenceSeconds: TimeInterval = 0
-
-    /// Host-clock time (seconds, same clock as SCStream PTS) of the first
-    /// recorded buffer — lets AudioMuxer align this track with system audio.
-    private(set) var firstBufferHostSeconds: Double?
-
-    private var lastBufferTime: Date?
-    private var watchdogTimer: Timer?
-    private let watchdogInterval: TimeInterval = 5.0
-    private let maxStallSeconds: TimeInterval = 10.0
-
-    private var configChangeObserver: NSObjectProtocol?
-    /// Main-queue only. True between a config-change notification and the
-    /// debounced engine restart it schedules.
-    private var restartPending = false
-    private let configChangeDebounce: TimeInterval = 0.5
-    private var bufferCount: UInt64 = 0
-    private var writeErrorCount: Int = 0
-    private let maxWriteErrors = 5
-
-    // --- Silence detection (mirrors SystemAudioRecorder) ---
-    /// Fires on transitions: true = mic silent for silenceDurationThreshold, false = voice resumed.
-    var onSilenceChanged: ((Bool) -> Void)?
-    private let silenceRMSThreshold: Float = 0.001
-    private let silenceDurationThreshold: TimeInterval = 90.0
-    private var silenceStart: Date?
-    private var isSilent = false
 
     init(outputURL: URL) {
         self.outputURL = outputURL
-        self.currentSegmentURL = outputURL
+        self._currentSegmentURL = outputURL
     }
 
     /// ExtAudioFile refuses to encode AAC beyond 2 channels: a 6ch or 7ch
@@ -111,79 +149,49 @@ class MicRecorder {
             .appendingPathExtension(aac ? outputURL.pathExtension : "caf")
     }
 
-    /// Closes the open file (AVAudioFile finalizes the m4a on release) and
-    /// records it as a segment. A segment with no frames in it is dropped and
-    /// its URL reused — that happens on the VP→raw fallback, which restarts
-    /// the engine before any audio has been captured.
-    private func closeCurrentSegment() {
-        guard let file = audioFile else { return }
-        let frames = file.length
-        let rate = file.processingFormat.sampleRate
-        audioFile = nil
-        guard frames > 0 else {
-            // Nothing landed in it — e.g. the engine failed to start after a
-            // device switch. Don't leave an empty part file behind. The
-            // primary mic file is left alone: downstream distinguishes "no mic
-            // audio" from "no mic file" and this keeps that unchanged.
-            if currentSegmentURL != outputURL {
-                try? FileManager.default.removeItem(at: currentSegmentURL)
-            }
-            return
-        }
-        segments.append(Segment(url: currentSegmentURL,
-                                firstBufferHostSeconds: currentSegmentFirstHost,
-                                frameCount: frames,
-                                sampleRate: rate))
-    }
-
-    /// Writes out the silence owed for time spent paused, so the mic file keeps
-    /// the same wall-clock length as the system track.
-    private func writePendingPauseSilence() {
-        guard pendingSilenceSeconds > 0.05, let file = audioFile else { return }
-        let seconds = pendingSilenceSeconds
-        pendingSilenceSeconds = 0
-        let format = file.processingFormat
-        // Written in chunks: a long pause would otherwise ask for one buffer of
-        // hundreds of MB. The full duration always goes in — capping it would
-        // silently shorten the mic timeline, which is the exact drift this
-        // padding exists to prevent. Encoded silence costs almost nothing.
-        let chunkFrames = AVAudioFrameCount(format.sampleRate)   // 1 s
-        guard let chunk = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { return }
-        var remaining = AVAudioFrameCount(seconds * format.sampleRate)
-        do {
-            while remaining > 0 {
-                let frames = min(remaining, chunkFrames)
-                chunk.frameLength = frames   // a fresh buffer is already zeroed
-                try file.write(from: chunk)
-                remaining -= frames
-            }
-            log(String(format: "[MicRecorder] Wrote %.1fs of silence for the paused stretch", seconds))
-        } catch {
-            log("[MicRecorder] ⚠️ Could not pad the pause: \(error.localizedDescription)")
-        }
-    }
-
-    /// Ends the current segment and points the recorder at the next one.
-    private func rollToNextSegment() {
-        let before = segments.count
-        closeCurrentSegment()
-        guard segments.count > before else { return }   // nothing was written yet
-        currentSegmentIndex += 1
-        currentSegmentFirstHost = nil
-        // currentSegmentURL is assigned when the next file is opened — only
-        // then is its channel count, and therefore its extension, known.
-    }
+    // MARK: - Lifecycle (main queue)
 
     func start() throws {
-        guard !isRecording else { return }
+        let alreadyRunning = lock.withLock { _isRecording }
+        guard !alreadyRunning else { return }
 
         try? FileManager.default.removeItem(at: outputURL)
 
         try startEngine()
-        isRecording = true
+        lock.withLock { _isRecording = true }
         startWatchdog()
 
         log("[MicRecorder] Recording started → \(outputURL.lastPathComponent)")
+    }
+
+    func stop() {
+        let wasRecording: Bool = lock.withLock {
+            defer { _isRecording = false }
+            return _isRecording
+        }
+        guard wasRecording else { return }
+
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        if let obs = configChangeObserver {
+            NotificationCenter.default.removeObserver(obs)
+            configChangeObserver = nil
+        }
+        // Outside the lock, and before touching the shared state: removeTap
+        // waits for an in-flight tap callback to return, and that callback
+        // wants the very lock we would be holding.
+        engine?.inputNode.removeTap(onBus: 0)
+        engine?.stop()
+        engine = nil
+
+        let (count, segmentCount) = lock.withLock { () -> (UInt64, Int) in
+            closeCurrentSegmentLocked()
+            _silenceStart = nil
+            _isSilent = false
+            return (_bufferCount, _segments.count)
+        }
+        let extra = segmentCount > 1 ? " in \(segmentCount) segments" : ""
+        log("[MicRecorder] Recording stopped (\(count) buffers total\(extra))")
     }
 
     /// AVFAudio raises ObjC exceptions on some device-transition failures
@@ -227,85 +235,139 @@ class MicRecorder {
         let nativeSampleRate = recordingFormat.sampleRate
         let nativeChannels = recordingFormat.channelCount
 
-        // An engine restart can come up in a different format (device switch).
-        // A file's format is fixed when it is opened, so the
-        // rest of the call continues in a NEW segment and MicStitcher rejoins
-        // them at the end. Writing the new format into the old file instead
-        // failed on every buffer and killed the mic for the remainder of the
-        // call (seen 2026-08-10: 16 kHz/2ch → 48 kHz/7ch on an AirPods switch
-        // ended the mic track 50 s into a 40 min call).
-        if let file = audioFile,
-           file.processingFormat.sampleRate != nativeSampleRate
-            || file.processingFormat.channelCount != nativeChannels {
-            log("[MicRecorder] Input format changed mid-recording (\(Int(file.processingFormat.sampleRate))Hz/\(file.processingFormat.channelCount)ch → \(Int(nativeSampleRate))Hz/\(nativeChannels)ch) — continuing in a new segment")
-            rollToNextSegment()
-        }
-
-        if audioFile == nil {
-            let useAAC = nativeChannels <= Self.maxAACChannels
-            currentSegmentURL = segmentURL(index: currentSegmentIndex, aac: useAAC)
-            let fileSettings: [String: Any] = useAAC ? [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: nativeSampleRate,
-                AVNumberOfChannelsKey: nativeChannels,
-                AVEncoderBitRateKey: 32000 * Int(nativeChannels),
-            ] : [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVSampleRateKey: nativeSampleRate,
-                AVNumberOfChannelsKey: nativeChannels,
-                AVLinearPCMBitDepthKey: 32,
-                AVLinearPCMIsFloatKey: true,
-            ]
-            if !useAAC {
-                log("[MicRecorder] \(nativeChannels)ch input — beyond what AAC can encode, writing LPCM \(currentSegmentURL.lastPathComponent) (converted at stop)")
+        // No tap is installed at this point (start() has none yet, every
+        // restart removes the old one first), so the file swap below cannot
+        // race a write — the lock states that invariant rather than assuming it.
+        var notices: [String] = []
+        try lock.withLock {
+            // An engine restart can come up in a different format (device
+            // switch). A file's format is fixed when it is opened, so the rest
+            // of the call continues in a NEW segment and MicStitcher rejoins
+            // them at the end. Writing the new format into the old file instead
+            // failed on every buffer and killed the mic for the remainder of
+            // the call (seen 2026-08-10: 16 kHz/2ch → 48 kHz/7ch on an AirPods
+            // switch ended the mic track 50 s into a 40 min call).
+            if let file = _audioFile,
+               file.processingFormat.sampleRate != nativeSampleRate
+                || file.processingFormat.channelCount != nativeChannels {
+                notices.append("[MicRecorder] Input format changed mid-recording (\(Int(file.processingFormat.sampleRate))Hz/\(file.processingFormat.channelCount)ch → \(Int(nativeSampleRate))Hz/\(nativeChannels)ch) — continuing in a new segment")
+                rollToNextSegmentLocked()
             }
-            self.audioFile = try AVAudioFile(
-                forWriting: currentSegmentURL,
-                settings: fileSettings,
-                commonFormat: .pcmFormatFloat32,
-                interleaved: false
-            )
+
+            if _audioFile == nil {
+                let useAAC = nativeChannels <= Self.maxAACChannels
+                _currentSegmentURL = segmentURL(index: _currentSegmentIndex, aac: useAAC)
+                let fileSettings: [String: Any] = useAAC ? [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVSampleRateKey: nativeSampleRate,
+                    AVNumberOfChannelsKey: nativeChannels,
+                    AVEncoderBitRateKey: 32000 * Int(nativeChannels),
+                ] : [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: nativeSampleRate,
+                    AVNumberOfChannelsKey: nativeChannels,
+                    AVLinearPCMBitDepthKey: 32,
+                    AVLinearPCMIsFloatKey: true,
+                ]
+                if !useAAC {
+                    notices.append("[MicRecorder] \(nativeChannels)ch input — beyond what AAC can encode, writing LPCM \(_currentSegmentURL.lastPathComponent) (converted at stop)")
+                }
+                _audioFile = try AVAudioFile(
+                    forWriting: _currentSegmentURL,
+                    settings: fileSettings,
+                    commonFormat: .pcmFormatFloat32,
+                    interleaved: false
+                )
+            }
         }
+        for notice in notices { log(notice) }
 
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, when in
-            guard let self = self, self.isRecording, !self.isPaused else { return }
-            self.lastBufferTime = Date()
-            self.bufferCount &+= 1
-            if self.currentSegmentFirstHost == nil, when.isHostTimeValid {
-                let hostSeconds = AVAudioTime.seconds(forHostTime: when.hostTime)
-                self.currentSegmentFirstHost = hostSeconds
-                // The overall start (first segment's) is what AudioMuxer aligns
-                // the track by; later segments only matter to MicStitcher.
-                if self.firstBufferHostSeconds == nil {
-                    self.firstBufferHostSeconds = hostSeconds
-                    log("[MicRecorder] First buffer at host time \(String(format: "%.3f", hostSeconds))s")
-                }
-            }
-
-            do {
-                self.writePendingPauseSilence()
-                try self.audioFile?.write(from: buffer)
-                self.writeErrorCount = 0
-            } catch {
-                self.writeErrorCount += 1
-                log("[MicRecorder] ❌ Write error (\(self.writeErrorCount)/\(self.maxWriteErrors)): \(error.localizedDescription)")
-                if self.writeErrorCount >= self.maxWriteErrors {
-                    log("[MicRecorder] ❌ Too many write errors — stopping mic recording")
-                    self.stop()
-                }
-            }
-            self.updateSilenceState(buffer)
+            self?.handleTap(buffer, at: when)
         }
 
         try engine.start()
         self.engine = engine
-        self.lastBufferTime = Date()
+        lock.withLock { _lastBufferTime = Date() }
         // Re-scoped on every start: each restart builds a new engine object,
         // and the observer is bound to a specific one.
         installConfigChangeObserver(for: engine)
 
         log("[MicRecorder] Engine started: \(Int(nativeSampleRate))Hz/\(nativeChannels)ch (native, no resampling)")
     }
+
+    // MARK: - The tap (audio thread)
+
+    /// What the tap asks the rest of the app to do once it has let go of the
+    /// lock. Nothing here is done on the audio thread itself.
+    private struct TapEffects {
+        var messages: [String] = []
+        var silenceChanged: Bool?
+        var needsRecovery = false
+    }
+
+    private func handleTap(_ buffer: AVAudioPCMBuffer, at when: AVAudioTime) {
+        var effects = TapEffects()
+        lock.withLock {
+            guard _isRecording, !_isPaused else { return }
+            _lastBufferTime = Date()
+            _bufferCount &+= 1
+            if _currentSegmentFirstHost == nil, when.isHostTimeValid {
+                let hostSeconds = AVAudioTime.seconds(forHostTime: when.hostTime)
+                _currentSegmentFirstHost = hostSeconds
+                // The overall start (first segment's) is what AudioMuxer aligns
+                // the track by; later segments only matter to MicStitcher.
+                if _firstBufferHostSeconds == nil {
+                    _firstBufferHostSeconds = hostSeconds
+                    effects.messages.append("[MicRecorder] First buffer at host time \(String(format: "%.3f", hostSeconds))s")
+                }
+            }
+
+            do {
+                writePendingPauseSilenceLocked(into: &effects)
+                try _audioFile?.write(from: buffer)
+                _writeErrorCount = 0
+            } catch {
+                _writeErrorCount += 1
+                effects.messages.append("[MicRecorder] ❌ Write error (\(_writeErrorCount)/\(maxWriteErrors)): \(error.localizedDescription)")
+                if _writeErrorCount >= maxWriteErrors, !_recoveryRequested {
+                    _recoveryRequested = true
+                    effects.needsRecovery = true
+                }
+            }
+            updateSilenceStateLocked(buffer, into: &effects)
+        }
+
+        for message in effects.messages { log(message) }
+        if let silent = effects.silenceChanged {
+            DispatchQueue.main.async { [weak self] in self?.onSilenceChanged?(silent) }
+        }
+        if effects.needsRecovery {
+            DispatchQueue.main.async { [weak self] in self?.recoverFromWriteFailures() }
+        }
+    }
+
+    /// The write path has been failing for `maxWriteErrors` buffers in a row —
+    /// the file and the incoming format have diverged (this is what an
+    /// unannounced device change looks like). Roll to a fresh segment in the
+    /// current format, which is the same repair a device switch gets. Only if
+    /// even that fails is the mic really gone, and then the session ends.
+    private func recoverFromWriteFailures() {
+        guard lock.withLock({ _isRecording }) else { return }
+        log("[MicRecorder] ⚠️ \(maxWriteErrors) write errors in a row — rolling to a fresh segment")
+        if restartEngine() {
+            lock.withLock {
+                _writeErrorCount = 0
+                _recoveryRequested = false
+            }
+            return
+        }
+        log("[MicRecorder] ❌ Mic cannot be restarted — ending the session")
+        stop()
+        onFatalError?()
+    }
+
+    // MARK: - Engine supervision (main queue)
 
     private func installConfigChangeObserver(for engine: AVAudioEngine) {
         if let previous = configChangeObserver {
@@ -339,18 +401,24 @@ class MicRecorder {
     /// Main-queue only, so `restartPending` needs no locking. If a change is
     /// somehow missed, the watchdog still restarts a stalled engine.
     private func scheduleConfigChangeRestart() {
-        guard isRecording, !restartPending else { return }
+        guard lock.withLock({ _isRecording }), !restartPending else { return }
         restartPending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + configChangeDebounce) { [weak self] in
             guard let self = self else { return }
             self.restartPending = false
-            self.handleConfigChange()
+            guard self.lock.withLock({ self._isRecording }) else { return }
+            log("[MicRecorder] ⚠️ AudioEngine config change (input device switch) — restarting engine")
+            // A failed restart is not fatal here: the watchdog keeps retrying
+            // for as long as no buffers arrive, which is what carries the mic
+            // through a device that is briefly absent.
+            _ = self.restartEngine()
         }
     }
 
-    private func handleConfigChange() {
-        guard isRecording else { return }
-        log("[MicRecorder] ⚠️ AudioEngine config change (input device switch) — restarting engine")
+    /// Tears the engine down and brings it back on a new segment. Returns
+    /// false when the mic could not be reopened.
+    @discardableResult
+    private func restartEngine() -> Bool {
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
@@ -358,11 +426,13 @@ class MicRecorder {
         // the engine is down for a second or two either way, and that hole is
         // what the stitcher bridges with silence. Continuing into the same file
         // would silently pull the rest of the call earlier than the system track.
-        rollToNextSegment()
+        lock.withLock { rollToNextSegmentLocked() }
         do {
             try startEngine()
+            return true
         } catch {
             log("[MicRecorder] ❌ Engine restart failed: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -377,31 +447,77 @@ class MicRecorder {
 
     private func checkWatchdog() {
         // A restart is already queued — don't stack a second one on top of it.
-        guard isRecording, !isPaused, !restartPending, let last = lastBufferTime else { return }
+        guard !restartPending else { return }
+        let snapshot = lock.withLock { (_isRecording, _isPaused, _lastBufferTime, _bufferCount) }
+        guard snapshot.0, !snapshot.1, let last = snapshot.2 else { return }
         let stalled = Date().timeIntervalSince(last)
-        if stalled > maxStallSeconds {
-            log("[MicRecorder] ⚠️ No buffers for \(Int(stalled))s (total \(bufferCount) buffers) — restarting engine")
-            handleConfigChange()
-        }
+        guard stalled > maxStallSeconds else { return }
+        log("[MicRecorder] ⚠️ No buffers for \(Int(stalled))s (total \(snapshot.3) buffers) — restarting engine")
+        restartEngine()
     }
 
-    func stop() {
-        guard isRecording else { return }
-        isRecording = false
-        watchdogTimer?.invalidate()
-        watchdogTimer = nil
-        if let obs = configChangeObserver {
-            NotificationCenter.default.removeObserver(obs)
-            configChangeObserver = nil
+    // MARK: - Segment bookkeeping (lock held)
+
+    /// Closes the open file (AVAudioFile finalizes the m4a on release) and
+    /// records it as a segment. A segment with no frames in it is dropped and
+    /// its URL reused — that happens when the engine fails to come back up
+    /// after a device switch, before any audio has been captured.
+    private func closeCurrentSegmentLocked() {
+        guard let file = _audioFile else { return }
+        let frames = file.length
+        let rate = file.processingFormat.sampleRate
+        _audioFile = nil
+        guard frames > 0 else {
+            // Nothing landed in it. Don't leave an empty part file behind. The
+            // primary mic file is left alone: downstream distinguishes "no mic
+            // audio" from "no mic file" and this keeps that unchanged.
+            if _currentSegmentURL != outputURL {
+                try? FileManager.default.removeItem(at: _currentSegmentURL)
+            }
+            return
         }
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
-        engine = nil
-        closeCurrentSegment()
-        silenceStart = nil
-        isSilent = false
-        let extra = segments.count > 1 ? " in \(segments.count) segments" : ""
-        log("[MicRecorder] Recording stopped (\(bufferCount) buffers total\(extra))")
+        _segments.append(Segment(url: _currentSegmentURL,
+                                 firstBufferHostSeconds: _currentSegmentFirstHost,
+                                 frameCount: frames,
+                                 sampleRate: rate))
+    }
+
+    /// Ends the current segment and points the recorder at the next one.
+    private func rollToNextSegmentLocked() {
+        let before = _segments.count
+        closeCurrentSegmentLocked()
+        guard _segments.count > before else { return }   // nothing was written yet
+        _currentSegmentIndex += 1
+        _currentSegmentFirstHost = nil
+        // _currentSegmentURL is assigned when the next file is opened — only
+        // then is its channel count, and therefore its extension, known.
+    }
+
+    /// Writes out the silence owed for time spent paused, so the mic file keeps
+    /// the same wall-clock length as the system track.
+    private func writePendingPauseSilenceLocked(into effects: inout TapEffects) {
+        guard _pendingSilenceSeconds > 0.05, let file = _audioFile else { return }
+        let seconds = _pendingSilenceSeconds
+        _pendingSilenceSeconds = 0
+        let format = file.processingFormat
+        // Written in chunks: a long pause would otherwise ask for one buffer of
+        // hundreds of MB. The full duration always goes in — capping it would
+        // silently shorten the mic timeline, which is the exact drift this
+        // padding exists to prevent. Encoded silence costs almost nothing.
+        let chunkFrames = AVAudioFrameCount(format.sampleRate)   // 1 s
+        guard let chunk = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { return }
+        var remaining = AVAudioFrameCount(seconds * format.sampleRate)
+        do {
+            while remaining > 0 {
+                let frames = min(remaining, chunkFrames)
+                chunk.frameLength = frames   // a fresh buffer is already zeroed
+                try file.write(from: chunk)
+                remaining -= frames
+            }
+            effects.messages.append(String(format: "[MicRecorder] Wrote %.1fs of silence for the paused stretch", seconds))
+        } catch {
+            effects.messages.append("[MicRecorder] ⚠️ Could not pad the pause: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Silence detection
@@ -423,31 +539,31 @@ class MicRecorder {
         return sqrtf(sum / Float(frameCount * channels))
     }
 
-    private func updateSilenceState(_ buffer: AVAudioPCMBuffer) {
+    private func updateSilenceStateLocked(_ buffer: AVAudioPCMBuffer, into effects: inout TapEffects) {
         let rms = bufferRMS(buffer)
         let now = Date()
-        if rms < silenceRMSThreshold {
-            if silenceStart == nil {
-                silenceStart = now
+        if rms < Self.silenceRMSThreshold {
+            if _silenceStart == nil {
+                _silenceStart = now
             }
-            if !isSilent, let start = silenceStart, now.timeIntervalSince(start) >= silenceDurationThreshold {
-                isSilent = true
-                log("[MicRecorder] Silence detected (>\(Int(silenceDurationThreshold))s)")
-                DispatchQueue.main.async { [weak self] in
-                    self?.onSilenceChanged?(true)
-                }
+            if !_isSilent, let start = _silenceStart,
+               now.timeIntervalSince(start) >= Self.silenceDurationThreshold {
+                _isSilent = true
+                effects.messages.append("[MicRecorder] Silence detected (>\(Int(Self.silenceDurationThreshold))s)")
+                effects.silenceChanged = true
             }
         } else {
-            silenceStart = nil
-            if isSilent {
-                isSilent = false
-                log("[MicRecorder] Voice resumed")
-                DispatchQueue.main.async { [weak self] in
-                    self?.onSilenceChanged?(false)
-                }
+            _silenceStart = nil
+            if _isSilent {
+                _isSilent = false
+                effects.messages.append("[MicRecorder] Voice resumed")
+                effects.silenceChanged = false
             }
         }
     }
+
+    private static let silenceRMSThreshold: Float = 0.001
+    private static let silenceDurationThreshold: TimeInterval = 90.0
 }
 
 enum MicRecorderError: Error, LocalizedError {

@@ -79,6 +79,15 @@ class RecordingManager {
                 micRec.onSilenceChanged = { [weak self] silent in
                     self?.onMicSilenceChanged?(silent)
                 }
+                // A dead mic ends the session, the same way an SCStream error
+                // does. Keeping the manager in `.recording` around a stopped
+                // recorder left the system track writing into a session that
+                // nothing would ever finalize.
+                micRec.onFatalError = { [weak self] in
+                    guard let self = self, self.state == .recording || self.state == .starting else { return }
+                    log("[RecordingManager] Mic recorder failed — stopping session")
+                    self.stopRecording(source: "mic-error")
+                }
                 self.micRecorder = micRec
                 try micRec.start()
 
