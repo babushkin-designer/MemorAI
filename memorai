@@ -107,8 +107,16 @@ cmd_status() {
         echo "Clipboard entries: 0"
     fi
 
-    local call_count=$(ls "$output"/call_*.m4a 2>/dev/null | wc -l | tr -d ' ')
+    # Counted by session, not by file: a call has two tracks, and the folder
+    # also holds work files (_mic.partN, _mic.aec) that are not recordings.
+    local call_count=$(ls "$output"/call_*_mic.m4a "$output"/call_*_system.m4a 2>/dev/null \
+        | sed -E 's/_(mic|system)\.m4a$//' | sort -u | wc -l | tr -d ' ')
     echo "Call recordings:  $call_count"
+
+    local unfinished=$(ls "$output"/call_*_session.json 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$unfinished" -gt 0 ]; then
+        echo "Unfinished calls: $unfinished (post-processing resumes at next app launch)"
+    fi
 }
 
 cmd_screenshots() {

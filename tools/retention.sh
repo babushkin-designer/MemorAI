@@ -14,6 +14,17 @@ DIR_BASE="${MEMORAI_DIR:-$(defaults read com.local.memorai outputPath 2>/dev/nul
 DIR="$DIR_BASE/screen"
 LOG="$DIR_BASE/memorai.log"
 
+# Abandoned call work files: mic segments whose stitch never succeeded and
+# ffmpeg temporaries left by a killed run. Recordings themselves are never
+# touched here. A session still waiting to be post-processed keeps its
+# `_session.json`, so skip anything whose manifest is still around.
+for work in "$DIR_BASE"/call_*_mic.part*.* "$DIR_BASE"/call_*.stitching.m4a "$DIR_BASE"/call_*.muxing.mp4; do
+    [ -f "$work" ] || continue
+    tag=$(basename "$work" | sed -E 's/^call_(.+)_[^_]+$/\1/')
+    [ -f "$DIR_BASE/call_${tag}_session.json" ] && continue
+    find "$work" -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
+done
+
 [ -d "$DIR" ] || exit 0
 
 before=$(find "$DIR" -type f \( -name '*.jpg' -o -name '*.heif' -o -name '*.png' \) | wc -l | tr -d ' ')
