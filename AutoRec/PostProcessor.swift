@@ -108,8 +108,40 @@ final class PostProcessor {
         }
     }
 
+    /// Mic part files belonging to `tag`, in recording order. `part10` must
+    /// come after `part2`, so the index is compared as a number.
+    static func orphanMicParts(names: [String], tag: String) -> [String] {
+        let prefix = "call_\(tag)_mic.part"
+        return names
+            .compactMap { name -> (Int, String)? in
+                guard name.hasPrefix(prefix) else { return nil }
+                let rest = name.dropFirst(prefix.count)               // "2.caf"
+                guard let dot = rest.firstIndex(of: "."),
+                      let index = Int(rest[..<dot]) else { return nil }
+                return (index, name)
+            }
+            .sorted { $0.0 < $1.0 }
+            .map { $0.1 }
+    }
+
+    /// A session killed mid-recording never wrote its segment list. The part
+    /// files are still there, so hand them to the stitcher and let ffmpeg say
+    /// whether anything is salvageable — an m4a killed before its moov atom
+    /// was written usually is not, but the LPCM parts are.
+    private func adoptOrphanParts(_ manifest: inout CallSessionManifest, in dir: URL) {
+        guard !manifest.recordingFinished, manifest.segments.isEmpty else { return }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        let parts = Self.orphanMicParts(names: names, tag: manifest.tag)
+        guard !parts.isEmpty else { return }
+        log("[PostProcessor] \(manifest.tag) was killed mid-recording — trying to salvage \(parts.count) mic part(s)")
+        manifest.segments = parts.map {
+            CallSessionManifest.record(.recovered(url: dir.appendingPathComponent($0)))
+        }
+    }
+
     private func publishMicTrack(_ manifest: inout CallSessionManifest, in dir: URL) {
         guard !manifest.stages.micPublished else { return }
+        adoptOrphanParts(&manifest, in: dir)
         guard let micURL = manifest.resolve(manifest.micFile, in: dir) else {
             manifest.stages.micPublished = true
             return

@@ -33,11 +33,22 @@ class MicRecorder {
         /// Host-clock seconds of this segment's first buffer — the stitcher
         /// derives the silence needed to bridge the engine restart from it.
         let firstBufferHostSeconds: Double?
+        /// Frames written, or -1 for a part file picked up off disk after a
+        /// crash — unknown length, which is not the same as no audio.
         let frameCount: AVAudioFramePosition
         let sampleRate: Double
 
-        var duration: Double { sampleRate > 0 ? Double(frameCount) / sampleRate : 0 }
-        var isEmpty: Bool { frameCount <= 0 }
+        var duration: Double {
+            sampleRate > 0 && frameCount > 0 ? Double(frameCount) / sampleRate : 0
+        }
+        var isEmpty: Bool { frameCount == 0 }
+
+        /// A segment the recorder never got to close (the process was killed
+        /// mid-call). Nothing is known about it beyond where it is, so the
+        /// stitcher joins it without trying to bridge a gap.
+        static func recovered(url: URL) -> Segment {
+            Segment(url: url, firstBufferHostSeconds: nil, frameCount: -1, sampleRate: 0)
+        }
     }
 
     private let outputURL: URL

@@ -31,8 +31,12 @@ class RetentionManager {
     func run() {
         let fm = FileManager.default
         let base = URL(fileURLWithPath: SettingsManager.shared.outputPath)
+        sweepCallWorkFiles(in: base)
         let screenDir = base.appendingPathComponent("screen")
-        guard fm.fileExists(atPath: screenDir.path) else { return }
+        guard fm.fileExists(atPath: screenDir.path) else {
+            capLog(at: base.appendingPathComponent("memorai.log"))
+            return
+        }
 
         let cutoff = Date().addingTimeInterval(-Double(retentionDays) * 86400)
         let imageExts: Set<String> = ["jpg", "heif", "png"]
@@ -62,6 +66,44 @@ class RetentionManager {
 
         log("[Retention] kept text, removed \(removed) images older than \(retentionDays)d")
         capLog(at: base.appendingPathComponent("memorai.log"))
+    }
+
+    /// Names that are call work files, never recordings: mic segments waiting
+    /// to be joined and the temp files ffmpeg builds. The finished tracks
+    /// (mic/system/screen/transcript) are the user's data and are never touched
+    /// here — deleting a recording is the user's call, not a timer's.
+    static func isCallWorkFile(_ name: String) -> Bool {
+        guard name.hasPrefix("call_") else { return false }
+        return name.hasSuffix(".stitching.m4a")
+            || name.hasSuffix(".muxing.mp4")
+            || (name.range(of: "_mic.part") != nil)
+    }
+
+    /// A stitch that never succeeded leaves its parts behind on purpose, so
+    /// they can be recovered by hand. After `retentionDays` nobody is coming
+    /// for them, and PostProcessor gave up on that session long ago.
+    private func sweepCallWorkFiles(in base: URL) {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: base.path) else { return }
+        // Never touch a session that is still waiting to be post-processed.
+        let pendingTags = Set(CallSessionManifest.pending(in: base).compactMap {
+            CallSessionManifest.load($0)?.tag
+        })
+        let cutoff = Date().addingTimeInterval(-Double(retentionDays) * 86400)
+        var removed = 0
+        for name in names where Self.isCallWorkFile(name) {
+            if let tag = CallHistory.parse(filename: name)?.tag, pendingTags.contains(tag) { continue }
+            let url = base.appendingPathComponent(name)
+            guard let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate, mtime < cutoff else { continue }
+            do {
+                try fm.removeItem(at: url)
+                removed += 1
+            } catch {}
+        }
+        if removed > 0 {
+            log("[Retention] removed \(removed) abandoned call work file(s) older than \(retentionDays)d")
+        }
     }
 
     /// Truncate the log to its tail IN PLACE (same inode) — the Logger keeps
