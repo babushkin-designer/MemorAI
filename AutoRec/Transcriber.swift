@@ -69,7 +69,10 @@ class Transcriber {
 
     /// Transcribe a recording session by merging mic + system audio into one file.
     /// Splits into 10-minute chunks to prevent whisper hallucination loops on long recordings.
-    func transcribeSession(micURL: URL?, systemURL: URL?, completion: @escaping () -> Void) {
+    /// `namingURL` decides the session tag and output file names; pass it when
+    /// the mic audio being transcribed is not the canonical `_mic.m4a`.
+    func transcribeSession(micURL: URL?, systemURL: URL?, namingURL: URL? = nil,
+                           completion: @escaping () -> Void) {
         transcriptionQueue.async { [self] in
             guard isAvailable, let wp = resolvedWhisperPath else {
                 log("[Transcriber] whisper-cli or model not found — skipping (whisper: \(resolvedWhisperPath ?? "not found"), model: \(resolvedModelPath))")
@@ -92,7 +95,11 @@ class Transcriber {
                 return
             }
 
-            let refURL = (micOK ? micURL : systemURL)!
+            // Names are derived from a file name, so the caller can hand in a
+            // different audio file than the one the session is named after —
+            // the echo-cancelled mic lives at call_<tag>_mic.aec.m4a and would
+            // otherwise produce call_<tag>_transcript.aec.txt.
+            let refURL = namingURL ?? (micOK ? micURL : systemURL)!
             let dir = refURL.deletingLastPathComponent()
             let baseName = refURL.deletingPathExtension().lastPathComponent
             let sessionTag = baseName

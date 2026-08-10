@@ -42,9 +42,21 @@ class SettingsManager {
     /// Acoustic echo cancellation on the call mic (Apple voice processing).
     /// Strips speaker playback from the mic track so speakerless calls don't
     /// end up with the far side recorded twice (mic leak + system audio).
+    ///
+    /// DEFAULT OFF, deliberately: Apple voice processing is not private to this
+    /// app. Enabling it reconfigures the SHARED input device for every other
+    /// client — measured on the built-in mic, the device's virtual format goes
+    /// from 48000Hz/1ch to 48000Hz/3ch while VP is active and back afterwards,
+    /// and the engine itself is handed a 7-channel stream. On 2026-08-10 a real
+    /// meeting was degraded this way ("очень плохо слышно") for the nine
+    /// minutes MemorAI held the mic, and quitting the app fixed it instantly.
+    /// Recording quality is never worth degrading the user's actual call, so
+    /// this stays opt-in: `defaults write com.local.memorai micEchoCancellation
+    /// -bool true` for anyone who wants AEC on speakerless calls and does not
+    /// mind the side effect.
     var micEchoCancellation: Bool {
         get {
-            if defaults.object(forKey: "micEchoCancellation") == nil { return true }
+            if defaults.object(forKey: "micEchoCancellation") == nil { return false }
             return defaults.bool(forKey: "micEchoCancellation")
         }
         set { defaults.set(newValue, forKey: "micEchoCancellation") }

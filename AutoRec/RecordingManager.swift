@@ -174,10 +174,20 @@ class RecordingManager {
                 DispatchQueue.main.async { pending() }
             }
 
+            // Strip the far side's speaker leak out of the mic track. Runs here,
+            // after the UI is idle and the quit completion has fired, because a
+            // long call takes minutes to process; the raw mic is left untouched
+            // and used as-is if anything about the result looks wrong.
+            var effectiveMicURL = micURL
+            if let micURL = micURL, let sysURL = sysURL,
+               EchoCanceller.shared.isAvailable {
+                effectiveMicURL = EchoCanceller.shared.process(micURL: micURL, systemURL: sysURL) ?? micURL
+            }
+
             // Mux mic + system audio into screen.mp4 in-place so the video file is
             // self-contained for downstream playback. Runs in parallel with transcription.
             if let screenURL = screenURL {
-                AudioMuxer.shared.muxScreenWithAudio(screenURL: screenURL, micURL: micURL, systemURL: sysURL,
+                AudioMuxer.shared.muxScreenWithAudio(screenURL: screenURL, micURL: effectiveMicURL, systemURL: sysURL,
                                                      micStartSeconds: micStart,
                                                      systemStartSeconds: sysStart,
                                                      videoStartSeconds: vidStart)
@@ -192,7 +202,11 @@ class RecordingManager {
                 isTranscribing = true
                 onStateChange?(state) // trigger UI update
                 log("[RecordingManager] Starting transcription…")
-                Transcriber.shared.transcribeSession(micURL: micURL, systemURL: sysURL) { [weak self] in
+                // Transcribe the cleaned mic but keep naming the session after
+                // the canonical file, or the transcript lands next to it under
+                // a mangled name.
+                Transcriber.shared.transcribeSession(micURL: effectiveMicURL, systemURL: sysURL,
+                                                     namingURL: micURL) { [weak self] in
                     self?.isTranscribing = false
                     self?.onTranscriptionDone?()
                     self?.onStateChange?(self?.state ?? .idle)
