@@ -147,26 +147,13 @@ class AudioMuxer {
         log(String(format: "[AudioMuxer] Muxing %@ → %@ (offsets mic %+.3fs, system %+.3fs)",
                    sources, screenURL.lastPathComponent, offsets.mic, offsets.system))
 
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: ffmpegPath)
-        task.arguments = args
-        let errPipe = Pipe()
-        task.standardOutput = Pipe()
-        task.standardError = errPipe
-
-        do {
-            try task.run()
-        } catch {
-            log("[AudioMuxer] ❌ ffmpeg launch failed: \(error.localizedDescription)")
-            try? FileManager.default.removeItem(at: tempURL)
-            return
-        }
-        task.waitUntilExit()
-
-        guard task.terminationStatus == 0 else {
-            let errData = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
-            let errMsg = String(data: errData.suffix(400), encoding: .utf8) ?? ""
-            log("[AudioMuxer] ❌ ffmpeg failed (exit \(task.terminationStatus)): \(errMsg)")
+        // Via ProcessRunner: reading stderr only after waitUntilExit() deadlocks
+        // whenever ffmpeg fills the 64 KB pipe buffer, which it does on a
+        // malformed input — exactly when the error text is worth having.
+        let result = ProcessRunner.run(ffmpegPath, args: args, timeout: 1800)
+        guard result.exitCode == 0 else {
+            let why = result.timedOut ? "timed out" : "exit \(result.exitCode)"
+            log("[AudioMuxer] ❌ ffmpeg failed (\(why)): \(result.stderrTail)")
             try? FileManager.default.removeItem(at: tempURL)
             return
         }
