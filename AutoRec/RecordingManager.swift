@@ -145,11 +145,27 @@ class RecordingManager {
             let micStart = micRecorder?.firstBufferHostSeconds
             let sysStart = systemAudioRecorder?.audioFirstPTSSeconds
             let vidStart = systemAudioRecorder?.videoFirstPTSSeconds
+            // An input-device switch splits the mic track; rejoin it before
+            // anything downstream reads micURL, so AudioMuxer and Transcriber
+            // keep seeing a single file.
+            let micSegments = micRecorder?.segments ?? []
             micRecorder = nil
             systemAudioRecorder = nil
             setState(.idle)
             onRecordingActiveChanged?(false)
             log("[RecordingManager] All recorders stopped")
+
+            // Before the completion fires: on app-quit that callback is what
+            // replies to applicationShouldTerminate, so anything left after it
+            // races the process exit.
+            // More than one segment (device switch), or a single segment that
+            // isn't the final file yet (LPCM, written when the input had more
+            // channels than AAC can encode).
+            let needsStitch = micSegments.count > 1
+                || (micSegments.first.map { $0.url != micURL } ?? false)
+            if needsStitch, let micURL = micURL {
+                MicStitcher.shared.stitch(segments: micSegments, outputURL: micURL)
+            }
 
             completion?()
             let queued = pendingStopCompletions
