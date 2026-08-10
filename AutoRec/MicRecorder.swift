@@ -135,16 +135,16 @@ class MicRecorder {
     /// Such input is written as LPCM instead and normalized to AAC at the end.
     private static let maxAACChannels: AVAudioChannelCount = 2
 
-    /// `call_<tag>_mic.m4a` for a plain first segment, otherwise
-    /// `call_<tag>_mic.part<N>.<ext>` — note CallHistory.parse reads the role
-    /// after the last underscore, so these land as role "mic.partN" and are
-    /// ignored by the Recent Calls menu instead of masquerading as mic tracks.
-    /// An LPCM first segment also gets a part name: the final m4a only appears
-    /// once MicStitcher has produced it, so nothing downstream can pick up a
-    /// mic file in a format it does not expect.
+    /// `call_<tag>_mic.part<N>.<ext>` — EVERY segment, including the first.
+    /// The canonical `call_<tag>_mic.m4a` is published by MicStitcher, and only
+    /// once it holds the whole track; while the first segment carried that name
+    /// itself, a failed stitch left the opening minutes of a call passing for
+    /// the whole of it, and AudioMuxer and Transcriber consumed it as such.
+    ///
+    /// CallHistory.parse reads the role after the last underscore, so these
+    /// land as role "mic.partN" and are ignored by the Recent Calls menu.
     private func segmentURL(index: Int, aac: Bool) -> URL {
-        guard index > 1 || !aac else { return outputURL }
-        return outputURL.deletingPathExtension()
+        outputURL.deletingPathExtension()
             .appendingPathExtension("part\(index)")
             .appendingPathExtension(aac ? outputURL.pathExtension : "caf")
     }
@@ -468,12 +468,9 @@ class MicRecorder {
         let rate = file.processingFormat.sampleRate
         _audioFile = nil
         guard frames > 0 else {
-            // Nothing landed in it. Don't leave an empty part file behind. The
-            // primary mic file is left alone: downstream distinguishes "no mic
-            // audio" from "no mic file" and this keeps that unchanged.
-            if _currentSegmentURL != outputURL {
-                try? FileManager.default.removeItem(at: _currentSegmentURL)
-            }
+            // Nothing landed in it — don't leave an empty part file behind for
+            // the stitcher (or the next launch's recovery pass) to find.
+            try? FileManager.default.removeItem(at: _currentSegmentURL)
             return
         }
         _segments.append(Segment(url: _currentSegmentURL,

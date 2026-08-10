@@ -167,13 +167,15 @@ class RecordingManager {
             // Before the completion fires: on app-quit that callback is what
             // replies to applicationShouldTerminate, so anything left after it
             // races the process exit.
-            // More than one segment (device switch), or a single segment that
-            // isn't the final file yet (LPCM, written when the input had more
-            // channels than AAC can encode).
-            let needsStitch = micSegments.count > 1
-                || (micSegments.first.map { $0.url != micURL } ?? false)
-            if needsStitch, let micURL = micURL {
-                MicStitcher.shared.stitch(segments: micSegments, outputURL: micURL)
+            //
+            // The mic is recorded into part files and only becomes
+            // call_<tag>_mic.m4a here. A failure is a failure: the canonical
+            // file stays absent, the parts stay on disk, and the muxer and the
+            // transcriber run without a mic track instead of being handed the
+            // first fragment of the call as if it were the whole thing.
+            if let micURL = micURL, !micSegments.isEmpty,
+               !MicStitcher.shared.stitch(segments: micSegments, outputURL: micURL) {
+                log("[RecordingManager] ❌ Mic track not assembled — \(micURL.lastPathComponent) is missing, parts kept: \(micSegments.map { $0.url.lastPathComponent }.joined(separator: ", "))")
             }
 
             completion?()

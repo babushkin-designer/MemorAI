@@ -115,15 +115,38 @@ class MicStitcher {
         return args
     }
 
-    /// Builds `outputURL` from `segments`. Returns true when `outputURL` holds
-    /// the whole mic track afterwards. On failure nothing is touched: the
-    /// segments stay on disk, named for manual recovery.
+    /// True when a lone segment is already the finished track in the output
+    /// format and only needs its canonical name — no transcode, no ffmpeg.
+    static func isReadyToPublish(_ segments: [MicRecorder.Segment], outputURL: URL) -> Bool {
+        segments.count == 1
+            && segments[0].url.pathExtension.lowercased() == outputURL.pathExtension.lowercased()
+    }
+
+    /// Publishes `outputURL` from `segments`. Returns true when `outputURL`
+    /// holds the whole mic track afterwards. On failure nothing is published:
+    /// the segments stay on disk under their part names, and the canonical mic
+    /// file stays absent rather than holding a fraction of the call.
     @discardableResult
     func stitch(segments: [MicRecorder.Segment], outputURL: URL) -> Bool {
         let usable = segments.filter { !$0.isEmpty && FileManager.default.fileExists(atPath: $0.url.path) }
         guard !usable.isEmpty else { return false }
         // A lone segment already sitting at the destination is the whole track.
-        guard usable.count > 1 || usable[0].url != outputURL else { return false }
+        guard usable.count > 1 || usable[0].url != outputURL else { return true }
+
+        // The common case — one uninterrupted segment in the output format —
+        // is a rename. Running it through ffmpeg would re-encode every call for
+        // nothing and add a failure mode to the path that publishes the track.
+        if Self.isReadyToPublish(usable, outputURL: outputURL) {
+            do {
+                try? FileManager.default.removeItem(at: outputURL)
+                try FileManager.default.moveItem(at: usable[0].url, to: outputURL)
+                log("[MicStitcher] Mic track published as \(outputURL.lastPathComponent)")
+                return true
+            } catch {
+                log("[MicStitcher] ❌ Could not publish \(usable[0].url.lastPathComponent): \(error.localizedDescription)")
+                return false
+            }
+        }
 
         let gaps = Self.gaps(for: usable.map { ($0.firstBufferHostSeconds, $0.duration) })
         let tempURL = outputURL.deletingPathExtension().appendingPathExtension("stitching.m4a")
