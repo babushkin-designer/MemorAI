@@ -1,6 +1,7 @@
 import Foundation
 
 /// Orchestrates system audio, mic, and screen recording.
+@MainActor
 class RecordingManager {
     private(set) var state: RecordingState = .idle
     var onStateChange: ((RecordingState) -> Void)?

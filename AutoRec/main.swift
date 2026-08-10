@@ -11,7 +11,9 @@ if runningApps.count > 1 {
 }
 
 let app = NSApplication.shared
-let delegate = AppDelegate()
+// Top-level code runs on the main thread, but the compiler does not know that
+// under this language mode; the delegate is main-actor bound.
+let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
 withExtendedLifetime(delegate) {
     app.run()

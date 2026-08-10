@@ -1,6 +1,7 @@
 import AVFoundation
 import Cocoa
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var recordingManager: RecordingManager!
