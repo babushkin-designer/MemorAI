@@ -230,7 +230,10 @@ final class PostProcessor {
         // transcript interleaves them in the order they were actually spoken.
         Transcriber.shared.transcribeSession(micURL: manifest.effectiveMicURL(in: dir),
                                              systemURL: manifest.resolve(manifest.systemFile, in: dir),
-                                             namingURL: manifest.resolve(manifest.micFile, in: dir)) {
+                                             namingURL: manifest.resolve(manifest.micFile, in: dir),
+                                             micStartSeconds: manifest.micStartSeconds,
+                                             systemStartSeconds: manifest.systemStartSeconds,
+                                             videoStartSeconds: manifest.videoStartSeconds) {
             done.signal()
         }
         done.wait()

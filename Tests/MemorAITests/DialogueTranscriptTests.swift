@@ -7,6 +7,39 @@ final class DialogueTranscriptTests: XCTestCase {
         TranscriptSegment(fromMs: fromMs, toMs: toMs, text: text)
     }
 
+    // MARK: - Putting both tracks on one timeline
+
+    func testShiftMovesSegmentsAndNeverGoesNegative() {
+        let segs = [seg(0, 500, "а"), seg(2000, 2500, "б")]
+        let later = Transcriber.shifted(segs, bySeconds: 1.19)
+        XCTAssertEqual(later.map { $0.fromMs }, [1190, 3190])
+        XCTAssertEqual(later.map { $0.toMs }, [1690, 3690])
+
+        let earlier = Transcriber.shifted(segs, bySeconds: -1.5)
+        XCTAssertEqual(earlier.map { $0.fromMs }, [0, 500])
+        XCTAssertEqual(Transcriber.shifted(segs, bySeconds: 0).map { $0.fromMs }, [0, 2000])
+    }
+
+    func testTrackOffsetsFixTheSpeakerOrderAroundAHandover() {
+        // Measured on a real call: the SCStream is up before the mic engine, so
+        // the mic file's zero is 1.19 s later in wall-clock terms. Read
+        // straight off each track, the reply looks like it came first.
+        let micStart = 1001.092, systemStart = 999.901, videoStart = 1000.0
+        let mic = [seg(0, 1500, "Да, согласен")]        // spoken at ~1001.1
+        let system = [seg(500, 1400, "Что думаешь?")]   // spoken at ~1000.4
+
+        let naive = Transcriber.dialogueTranscript(mic: mic, system: system)
+        XCTAssertTrue(naive.hasPrefix("[00:00] Я:"), naive)
+
+        let offsets = AudioMuxer.computeOffsets(micStart: micStart, systemStart: systemStart,
+                                                videoStart: videoStart)
+        let aligned = Transcriber.dialogueTranscript(
+            mic: Transcriber.shifted(mic, bySeconds: offsets.mic),
+            system: Transcriber.shifted(system, bySeconds: offsets.system))
+        XCTAssertTrue(aligned.hasPrefix("[00:00] Собеседник: Что думаешь?"), aligned)
+        XCTAssertTrue(aligned.contains("Я: Да, согласен"), aligned)
+    }
+
     func testInterleavesByStartTime() {
         let mic = [seg(0, 2000, "Привет"), seg(10_000, 12_000, "Да, вижу")]
         let system = [seg(3000, 8000, "Привет, слышно меня?")]

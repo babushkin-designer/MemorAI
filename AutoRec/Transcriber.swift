@@ -71,7 +71,13 @@ class Transcriber {
     /// Splits into 10-minute chunks to prevent whisper hallucination loops on long recordings.
     /// `namingURL` decides the session tag and output file names; pass it when
     /// the mic audio being transcribed is not the canonical `_mic.m4a`.
+    /// `micStartSeconds`/`systemStartSeconds`/`videoStartSeconds` are the
+    /// host-clock starts of the three files; they put both transcripts on one
+    /// timeline. Omitting them transcribes each track from its own zero, which
+    /// mis-orders the dialogue by however far apart the recorders started.
     func transcribeSession(micURL: URL?, systemURL: URL?, namingURL: URL? = nil,
+                           micStartSeconds: Double? = nil, systemStartSeconds: Double? = nil,
+                           videoStartSeconds: Double? = nil,
                            completion: @escaping () -> Void) {
         transcriptionQueue.async { [self] in
             guard isAvailable, let wp = resolvedWhisperPath else {
@@ -128,7 +134,16 @@ class Transcriber {
                 let sysSegs = transcribeTrack(systemURL!, roleTag: "system", whisperExec: whisperExec,
                                               modelFile: modelFile, lang: lang, dir: dir, sessionTag: sessionTag)
                 if let micSegs = micSegs, let sysSegs = sysSegs, !(micSegs.isEmpty && sysSegs.isEmpty) {
-                    fullTranscript = Self.dialogueTranscript(mic: micSegs, system: sysSegs)
+                    let offsets = AudioMuxer.computeOffsets(micStart: micStartSeconds,
+                                                            systemStart: systemStartSeconds,
+                                                            videoStart: videoStartSeconds)
+                    if offsets.mic != 0 || offsets.system != 0 {
+                        log(String(format: "[Transcriber] [\(sessionTag)] Aligning speakers (mic %+.3fs, system %+.3fs)",
+                                   offsets.mic, offsets.system))
+                    }
+                    fullTranscript = Self.dialogueTranscript(
+                        mic: Self.shifted(micSegs, bySeconds: offsets.mic),
+                        system: Self.shifted(sysSegs, bySeconds: offsets.system))
                 } else {
                     log("[Transcriber] [\(sessionTag)] ⚠️ Dual-track path failed — falling back to merged mix")
                     fullTranscript = transcribeMergedMix(
@@ -325,6 +340,22 @@ class Transcriber {
 
     /// Interleave mic ("Я") and system ("Собеседник") segments by start time into
     /// a dialogue transcript, grouping consecutive same-speaker segments into one line.
+    /// Moves a track's segments onto the shared timeline. The two recorders do
+    /// not start together — the SCStream is up before the mic engine, measured
+    /// at 1.19 s apart on a real call — so timestamps read straight off each
+    /// track interleave the dialogue in the wrong order around a handover.
+    /// AudioMuxer already computes these offsets for the video; this applies
+    /// the same numbers to the transcript.
+    static func shifted(_ segments: [TranscriptSegment], bySeconds offset: Double) -> [TranscriptSegment] {
+        let ms = Int((offset * 1000).rounded())
+        guard ms != 0 else { return segments }
+        return segments.map {
+            TranscriptSegment(fromMs: max(0, $0.fromMs + ms),
+                              toMs: max(0, $0.toMs + ms),
+                              text: $0.text)
+        }
+    }
+
     static func dialogueTranscript(mic: [TranscriptSegment], system: [TranscriptSegment]) -> String {
         var tagged = mic.map { (seg: $0, speaker: "Я") } + system.map { (seg: $0, speaker: "Собеседник") }
         tagged.sort { $0.seg.fromMs < $1.seg.fromMs }
