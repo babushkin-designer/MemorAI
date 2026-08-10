@@ -22,6 +22,27 @@ final class CallHistoryTests: XCTestCase {
         XCTAssertNil(CallHistory.parse(filename: "call_incomplete"))
     }
 
+    func testWorkFilesAloneDoNotMakeASession() throws {
+        // A call that is still running — or one whose stitch failed — leaves
+        // only work files behind under its tag. None of them is playable, so
+        // the tag must not show up in Recent Calls at all.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("memorai_phantomtest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        for name in [
+            "call_2026-08-10_12-00-00_mic.part1.caf",
+            "call_2026-08-10_12-00-00_session.json",
+            "call_2026-08-10_11-00-00_mic.m4a",
+        ] {
+            try Data().write(to: dir.appendingPathComponent(name))
+        }
+
+        let sessions = CallHistory.recentSessions(outputPath: dir.path)
+        XCTAssertEqual(sessions.map { $0.tag }, ["2026-08-10_11-00-00"])
+    }
+
     func testGroupsFilesIntoSessions() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("memorai_calltest_\(UUID().uuidString)")

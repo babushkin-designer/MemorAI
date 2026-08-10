@@ -46,6 +46,11 @@ enum CallHistory {
             guard name.hasPrefix("call_") else { continue }
             guard let (tag, role) = Self.parse(filename: name) else { continue }
 
+            // Only recognized roles create or update a session. A call in
+            // progress (or one whose stitch failed) leaves work files like
+            // `call_<tag>_mic.part1.caf` and `call_<tag>_session.json` in the
+            // same folder; storing the session before this switch turned any of
+            // them into an empty phantom entry in the Recent Calls menu.
             var session = byTag[tag] ?? CallSession(tag: tag, date: fmt.date(from: tag) ?? Date.distantPast)
             let url = dir.appendingPathComponent(name)
             switch role {
@@ -56,7 +61,7 @@ enum CallHistory {
             case "summary":    session.summaryURL = url
             case "followup":   session.followupURL = url
             case "title":      session.titleURL = url
-            default:           break
+            default:           continue
             }
             byTag[tag] = session
         }
