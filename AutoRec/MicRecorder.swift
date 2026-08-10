@@ -63,11 +63,6 @@ class MicRecorder {
     /// Host-clock time (seconds, same clock as SCStream PTS) of the first
     /// recorded buffer — lets AudioMuxer align this track with system audio.
     private(set) var firstBufferHostSeconds: Double?
-    /// True while the running engine has Apple voice processing (AEC) active.
-    private var voiceProcessingActive = false
-    /// Set once voice processing failed on this machine/session; further
-    /// engine (re)starts skip it instead of failing the whole recording.
-    private var voiceProcessingUnavailable = false
 
     private var lastBufferTime: Date?
     private var watchdogTimer: Timer?
@@ -195,12 +190,12 @@ class MicRecorder {
     /// instead of returning an error, and those abort the process rather than
     /// landing in a Swift `catch` — an AirPods switch mid-call killed the app
     /// this way. Routing the start through the shim turns such a raise into an
-    /// ordinary error, so the fallback below can do its job.
-    private func startEngineTrapping(withVoiceProcessing useVP: Bool) throws {
+    /// ordinary error the caller can handle.
+    private func startEngine() throws {
         var swiftError: Error?
         var raised: NSError?
         let completed = MEMRunCatchingExceptions({
-            do { try self.startEngine(withVoiceProcessing: useVP) } catch { swiftError = error }
+            do { try self.openEngine() } catch { swiftError = error }
         }, &raised)
         if let swiftError = swiftError { throw swiftError }
         if !completed, let raised = raised {
@@ -209,37 +204,13 @@ class MicRecorder {
         }
     }
 
-    private func startEngine() throws {
-        let wantVP = SettingsManager.shared.micEchoCancellation && !voiceProcessingUnavailable
-        if wantVP {
-            do {
-                try startEngineTrapping(withVoiceProcessing: true)
-                return
-            } catch {
-                voiceProcessingUnavailable = true
-                log("[MicRecorder] ⚠️ Voice processing failed (\(error.localizedDescription)) — falling back to raw mic")
-                // The file (if any) was created for the VP format; recreate for raw.
-                if bufferCount == 0 { audioFile = nil }
-            }
-        }
-        try startEngineTrapping(withVoiceProcessing: false)
-    }
-
-    private func startEngine(withVoiceProcessing useVP: Bool) throws {
+    /// Captures the mic exactly as the device delivers it. No Apple voice
+    /// processing: it reconfigures the shared input device for every other app
+    /// on the machine and made real meetings sound bad to the far side. Echo
+    /// is removed after the call instead, by EchoCanceller.
+    private func openEngine() throws {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
-
-        // Acoustic echo cancellation: without it, on speakerless setups the
-        // far side's voice leaks from the speakers into the mic and the muxed
-        // video plays every remote phrase twice (~130 ms apart — audible echo).
-        if useVP {
-            try inputNode.setVoiceProcessingEnabled(true)
-            // Don't let VP duck the user's actual call audio while we record.
-            inputNode.voiceProcessingOtherAudioDuckingConfiguration =
-                AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
-                    enableAdvancedDucking: false, duckingLevel: .min)
-        }
-        voiceProcessingActive = useVP
 
         let recordingFormat = inputNode.outputFormat(forBus: 0)
 
@@ -256,8 +227,8 @@ class MicRecorder {
         let nativeSampleRate = recordingFormat.sampleRate
         let nativeChannels = recordingFormat.channelCount
 
-        // An engine restart can come up in a different format (device switch,
-        // VP→raw fallback). A file's format is fixed when it is opened, so the
+        // An engine restart can come up in a different format (device switch).
+        // A file's format is fixed when it is opened, so the
         // rest of the call continues in a NEW segment and MicStitcher rejoins
         // them at the end. Writing the new format into the old file instead
         // failed on every buffer and killed the mic for the remainder of the
@@ -333,7 +304,7 @@ class MicRecorder {
         // and the observer is bound to a specific one.
         installConfigChangeObserver(for: engine)
 
-        log("[MicRecorder] Engine started: \(Int(nativeSampleRate))Hz/\(nativeChannels)ch (native, no resampling), echo cancellation \(useVP ? "ON" : "off")")
+        log("[MicRecorder] Engine started: \(Int(nativeSampleRate))Hz/\(nativeChannels)ch (native, no resampling)")
     }
 
     private func installConfigChangeObserver(for engine: AVAudioEngine) {
@@ -409,12 +380,6 @@ class MicRecorder {
         guard isRecording, !isPaused, !restartPending, let last = lastBufferTime else { return }
         let stalled = Date().timeIntervalSince(last)
         if stalled > maxStallSeconds {
-            // A VP engine that delivers no buffers means voice processing is
-            // broken on this system (beta-OS territory) — restart without it.
-            if voiceProcessingActive && bufferCount == 0 {
-                voiceProcessingUnavailable = true
-                log("[MicRecorder] ⚠️ Voice-processing engine produced no buffers — disabling echo cancellation")
-            }
             log("[MicRecorder] ⚠️ No buffers for \(Int(stalled))s (total \(bufferCount) buffers) — restarting engine")
             handleConfigChange()
         }
