@@ -198,10 +198,22 @@ class RecordingManager {
             onRecordingActiveChanged?(false)
             log("[RecordingManager] All recorders stopped")
 
+            // No manifest means no session: a startup that failed removed its
+            // own, and a synthesized replacement here would either enqueue the
+            // partial files of a failed start as a finished call, or — worse —
+            // stand in for a real session with none of its file names, which
+            // would silently skip publishing the mic track. The completions
+            // below still have to fire: on quit one of them is what lets the
+            // process exit.
+            guard var manifest = currentManifest else {
+                log("[RecordingManager] Session never came up — nothing to post-process")
+                drainStopCompletions(completion)
+                return
+            }
+
             // The timings above live only in the recorders; write them down
             // before anything else can go wrong, or a session interrupted
             // later can never be aligned again.
-            var manifest = currentManifest ?? CallSessionManifest(tag: Self.tag(of: micURL))
             manifest.micStartSeconds = micStart
             manifest.systemStartSeconds = sysStart
             manifest.videoStartSeconds = vidStart
@@ -225,12 +237,7 @@ class RecordingManager {
             manifest.save(in: baseDir)
             currentManifest = nil
 
-            completion?()
-            let queued = pendingStopCompletions
-            pendingStopCompletions = []
-            for pending in queued {
-                DispatchQueue.main.async { pending() }
-            }
+            drainStopCompletions(completion)
 
             // Echo cancellation, muxing and transcription take minutes on a
             // long call — far longer than a quit may be held up. They run in
@@ -239,11 +246,16 @@ class RecordingManager {
         }
     }
 
-    /// Fallback tag when a stop somehow runs without the manifest from start.
-    private static func tag(of micURL: URL?) -> String {
-        guard let name = micURL?.lastPathComponent,
-              let parsed = CallHistory.parse(filename: name) else { return timestamp() }
-        return parsed.tag
+    /// Fires this stop's completion plus any that queued behind it. Every exit
+    /// from the stop task must go through here — a dropped completion hangs
+    /// `applicationShouldTerminate` until its failsafe fires.
+    private func drainStopCompletions(_ completion: (() -> Void)?) {
+        completion?()
+        let queued = pendingStopCompletions
+        pendingStopCompletions = []
+        for pending in queued {
+            DispatchQueue.main.async { pending() }
+        }
     }
 
     private func setState(_ newState: RecordingState) {
