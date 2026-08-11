@@ -12,6 +12,9 @@ import Foundation
 class AudioMuxer {
     static let shared = AudioMuxer()
 
+    /// What the recorders capture at, and what the muxed video keeps.
+    static let outputSampleRate = 48000
+
     private let ffmpegPath: String = {
         for path in ["/opt/homebrew/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
             if FileManager.default.fileExists(atPath: path) { return path }
@@ -121,6 +124,12 @@ class AudioMuxer {
             "-map", audioMap,
             "-c:v", "copy",
             "-c:a", "aac",
+            // Pinned, not inherited: amix adopts the sample rate of its FIRST
+            // input, and the echo-cancelled mic is 16 kHz (the model's rate).
+            // Without this the far side's 48 kHz voice was resampled down to
+            // 16 kHz on its way into the video — measured on the 2026-08-11
+            // call, the first one where the cleaned mic was actually used.
+            "-ar", "\(outputSampleRate)",
             "-b:a", "128k",
             outPath,
         ])

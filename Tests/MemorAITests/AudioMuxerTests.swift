@@ -106,4 +106,25 @@ final class AudioMuxerTests: XCTestCase {
         }
         return nil
     }
+    func testOutputSampleRateIsPinnedSoTheCleanedMicCannotDragItDown() {
+        // The echo-cancelled mic is 16 kHz (the model's rate) and amix adopts
+        // its FIRST input's rate, so without pinning, the far side's 48 kHz
+        // voice was resampled down to 16 kHz on its way into the video.
+        // Measured on the 2026-08-11 call: 16000 Hz in the mp4 against 48000
+        // on the day the cleaned track was declined.
+        let both = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: "m.aec.m4a", sysPath: "y.m4a",
+                                           micOffset: 0.1, sysOffset: 0, outPath: "o.mp4")
+        XCTAssertEqual(value(after: "-ar", in: both), "48000")
+
+        // Every shape of the graph, including the one with no filter at all.
+        let micOnly = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: "m.m4a", sysPath: nil,
+                                              micOffset: 0, sysOffset: 0, outPath: "o.mp4")
+        XCTAssertFalse(micOnly.contains("-filter_complex"))
+        XCTAssertEqual(value(after: "-ar", in: micOnly), "48000")
+
+        let sysShifted = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: nil, sysPath: "y.m4a",
+                                                 micOffset: 0, sysOffset: -0.5, outPath: "o.mp4")
+        XCTAssertEqual(value(after: "-ar", in: sysShifted), "48000")
+    }
+
 }
