@@ -371,6 +371,16 @@ class Transcriber {
     /// splits one person talking to themselves for a while.
     static let sameSpeakerGapBreakMs = 5_000
 
+    /// Hard ceiling on how much wall-clock one line may cover, whatever the
+    /// pauses do. Needed because the pause rule alone did not deliver: on the
+    /// 2026-08-11 daily it turned 7 lines into 19, but the worst block only
+    /// shrank from 9.4 to 7.7 minutes — whisper routinely stretches a segment
+    /// across a short silence, so the gaps it reports are smaller than the
+    /// silence actually in the audio. The break lands on a segment boundary,
+    /// so a sentence is never cut in half; a block ends up spanning this plus
+    /// the length of the segment that crossed the line.
+    static let sameSpeakerMaxRunMs = 90_000
+
     static func dialogueTranscript(mic: [TranscriptSegment], system: [TranscriptSegment]) -> String {
         var tagged = mic.map { (seg: $0, speaker: "Я") } + system.map { (seg: $0, speaker: "Собеседник") }
         tagged.sort { $0.seg.fromMs < $1.seg.fromMs }
@@ -383,7 +393,10 @@ class Transcriber {
         var curText = tagged[0].seg.text
         for entry in tagged.dropFirst() {
             let gap = entry.seg.fromMs - curEnd
-            if entry.speaker == curSpeaker && gap <= Self.sameSpeakerGapBreakMs {
+            let run = entry.seg.fromMs - curStart
+            if entry.speaker == curSpeaker
+                && gap <= Self.sameSpeakerGapBreakMs
+                && run < Self.sameSpeakerMaxRunMs {
                 curText += " " + entry.seg.text
                 curEnd = max(curEnd, entry.seg.toMs)
             } else {

@@ -131,6 +131,45 @@ final class DialogueTranscriptTests: XCTestCase {
         """)
     }
 
+    func testGaplessMonologueIsStillCutIntoSeekableLines() {
+        // Whisper stretches segments across short silences, so a long stretch
+        // of one person talking can arrive with no gap big enough to break on.
+        // The run cap is what keeps that from becoming a wall of text.
+        var segs: [TranscriptSegment] = []
+        var t = 0
+        while t < 600_000 {                       // 10 minutes, 8 s per segment
+            segs.append(seg(t, t + 7_000, "фраза"))
+            t += 8_000
+        }
+        let out = Transcriber.dialogueTranscript(mic: [], system: segs)
+        let lines = out.split(separator: "\n")
+        XCTAssertGreaterThanOrEqual(lines.count, 6, out.prefix(200).description)
+
+        // No line may cover meaningfully more than the cap plus one segment.
+        let starts = lines.compactMap { line -> Int? in
+            guard let close = line.firstIndex(of: "]") else { return nil }
+            let parts = line[line.index(after: line.startIndex)..<close].split(separator: ":")
+            guard parts.count == 2, let m = Int(parts[0]), let s = Int(parts[1]) else { return nil }
+            return (m * 60 + s) * 1000
+        }
+        XCTAssertEqual(starts.count, lines.count)
+        for (i, start) in starts.enumerated() where i + 1 < starts.count {
+            XCTAssertLessThanOrEqual(starts[i + 1] - start,
+                                     Transcriber.sameSpeakerMaxRunMs + 10_000)
+        }
+    }
+
+    func testRunCapLeavesOrdinaryTurnsAlone() {
+        // A turn well under the cap must stay one line — the cap is a backstop,
+        // not a chopper.
+        let mic = [seg(0, 20_000, "Первое."), seg(21_000, 40_000, "Второе.")]
+        let out = Transcriber.dialogueTranscript(mic: mic, system: [])
+        XCTAssertEqual(out, """
+        [00:00] Я: Первое. Второе.
+
+        """)
+    }
+
     func testEmptyInputProducesEmptyString() {
         XCTAssertEqual(Transcriber.dialogueTranscript(mic: [], system: []), "")
     }
