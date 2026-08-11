@@ -84,6 +84,8 @@ class AudioMuxer {
         var args: [String] = ["-y", "-v", "error", "-i", screenPath]
         for input in inputs { args.append(contentsOf: ["-i", input.path]) }
 
+        func src(_ i: Int) -> String { "[\(i + 1):a]" }
+
         func shiftOps(_ offset: Double) -> String? {
             if offset > 0.001 {
                 return "adelay=\(Int((offset * 1000).rounded())):all=1"
@@ -97,38 +99,36 @@ class AudioMuxer {
         var filterParts: [String] = []
         var pads: [String] = []
         for (i, input) in inputs.enumerated() {
-            let src = "[\(i + 1):a]"
-            if let ops = shiftOps(input.offset) {
-                filterParts.append("\(src)\(ops)[t\(i)]")
-                pads.append("[t\(i)]")
-            } else {
-                pads.append(src)
-            }
+            // EVERY input is resampled BEFORE it reaches amix, which otherwise
+            // adopts the rate of its first input: the echo-cancelled mic is
+            // 16 kHz (the model's rate), and on the 2026-08-11 call — the first
+            // one where the cleaned track was actually used — it dragged the
+            // far side's 48 kHz voice down with it. Doing this on the output
+            // instead is not the same fix and was measured not to work: the mix
+            // is already band-limited by then, so upsampling it back only
+            // relabels the file (8-12 kHz came out 23 dB down, 12-20 kHz 50 dB).
+            var ops = ["aresample=\(outputSampleRate)"]
+            if let shift = shiftOps(input.offset) { ops.append(shift) }
+            filterParts.append("\(src(i))\(ops.joined(separator: ","))[t\(i)]")
+            pads.append("[t\(i)]")
         }
 
         let audioMap: String
         if pads.count == 2 {
             filterParts.append("\(pads[0])\(pads[1])amix=inputs=2:duration=longest:dropout_transition=0[a]")
             audioMap = "[a]"
-        } else if filterParts.isEmpty {
-            audioMap = "1:a"
         } else {
             audioMap = pads[0]
         }
 
-        if !filterParts.isEmpty {
-            args.append(contentsOf: ["-filter_complex", filterParts.joined(separator: ";")])
-        }
+        args.append(contentsOf: ["-filter_complex", filterParts.joined(separator: ";")])
         args.append(contentsOf: [
             "-map", "0:v",
             "-map", audioMap,
             "-c:v", "copy",
             "-c:a", "aac",
-            // Pinned, not inherited: amix adopts the sample rate of its FIRST
-            // input, and the echo-cancelled mic is 16 kHz (the model's rate).
-            // Without this the far side's 48 kHz voice was resampled down to
-            // 16 kHz on its way into the video — measured on the 2026-08-11
-            // call, the first one where the cleaned mic was actually used.
+            // Belt and braces: the graph above already delivers this rate, and
+            // this keeps the container honest whatever shape the graph takes.
             "-ar", "\(outputSampleRate)",
             "-b:a", "128k",
             outPath,

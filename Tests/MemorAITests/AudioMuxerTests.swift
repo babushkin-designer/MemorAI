@@ -46,7 +46,8 @@ final class AudioMuxerTests: XCTestCase {
                                            micOffset: 0, sysOffset: 0, outPath: "o.mp4")
         XCTAssertEqual(args.filter { $0 == "-i" }.count, 3)
         let filter = value(after: "-filter_complex", in: args)
-        XCTAssertEqual(filter, "[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[a]")
+        XCTAssertEqual(filter, "[1:a]aresample=48000[t0];[2:a]aresample=48000[t1];"
+            + "[t0][t1]amix=inputs=2:duration=longest:dropout_transition=0[a]")
         XCTAssertEqual(value(after: "-map", in: args, occurrence: 2), "[a]")
     }
 
@@ -54,38 +55,42 @@ final class AudioMuxerTests: XCTestCase {
         let args = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: "m.m4a", sysPath: "y.m4a",
                                            micOffset: 0.1326, sysOffset: 0, outPath: "o.mp4")
         let filter = value(after: "-filter_complex", in: args)!
-        XCTAssertTrue(filter.contains("[1:a]adelay=133:all=1[t0]"), filter)
-        XCTAssertTrue(filter.contains("[t0][2:a]amix=inputs=2"), filter)
+        XCTAssertTrue(filter.contains("[1:a]aresample=48000,adelay=133:all=1[t0]"), filter)
+        XCTAssertTrue(filter.contains("[t0][t1]amix=inputs=2"), filter)
     }
 
     func testNegativeOffsetBecomesHeadTrim() {
         let args = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: "m.m4a", sysPath: "y.m4a",
                                            micOffset: 0.2, sysOffset: -0.03, outPath: "o.mp4")
         let filter = value(after: "-filter_complex", in: args)!
-        XCTAssertTrue(filter.contains("[1:a]adelay=200:all=1[t0]"), filter)
-        XCTAssertTrue(filter.contains("[2:a]atrim=start=0.030,asetpts=PTS-STARTPTS[t1]"), filter)
+        XCTAssertTrue(filter.contains("[1:a]aresample=48000,adelay=200:all=1[t0]"), filter)
+        XCTAssertTrue(filter.contains("[2:a]aresample=48000,atrim=start=0.030,asetpts=PTS-STARTPTS[t1]"), filter)
         XCTAssertTrue(filter.contains("[t0][t1]amix=inputs=2"), filter)
     }
 
-    func testSingleTrackNoOffsetMapsDirectly() {
+    func testSingleTrackStillGoesThroughTheResampler() {
+        // Even alone, the cleaned mic is 16 kHz; mapping it straight through
+        // would hand the video a 16 kHz track.
         let args = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: nil, sysPath: "y.m4a",
                                            micOffset: 0, sysOffset: 0, outPath: "o.mp4")
-        XCTAssertFalse(args.contains("-filter_complex"))
-        XCTAssertEqual(value(after: "-map", in: args, occurrence: 2), "1:a")
+        XCTAssertEqual(value(after: "-filter_complex", in: args), "[1:a]aresample=48000[t0]")
+        XCTAssertEqual(value(after: "-map", in: args, occurrence: 2), "[t0]")
     }
 
     func testSingleTrackWithOffsetGoesThroughFilter() {
         let args = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: "m.m4a", sysPath: nil,
                                            micOffset: 0.5, sysOffset: 0, outPath: "o.mp4")
-        XCTAssertEqual(value(after: "-filter_complex", in: args), "[1:a]adelay=500:all=1[t0]")
+        XCTAssertEqual(value(after: "-filter_complex", in: args),
+                       "[1:a]aresample=48000,adelay=500:all=1[t0]")
         XCTAssertEqual(value(after: "-map", in: args, occurrence: 2), "[t0]")
     }
 
     func testTinyOffsetsAreIgnored() {
         let args = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: "m.m4a", sysPath: "y.m4a",
                                            micOffset: 0.0005, sysOffset: -0.0004, outPath: "o.mp4")
-        let filter = value(after: "-filter_complex", in: args)
-        XCTAssertEqual(filter, "[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[a]")
+        let filter = value(after: "-filter_complex", in: args)!
+        XCTAssertFalse(filter.contains("adelay"), filter)
+        XCTAssertFalse(filter.contains("atrim"), filter)
     }
 
     func testVideoCopiedAudioReencoded() {
@@ -106,25 +111,24 @@ final class AudioMuxerTests: XCTestCase {
         }
         return nil
     }
-    func testOutputSampleRateIsPinnedSoTheCleanedMicCannotDragItDown() {
+    func testEveryInputIsResampledBeforeAmixNotAfter() {
         // The echo-cancelled mic is 16 kHz (the model's rate) and amix adopts
-        // its FIRST input's rate, so without pinning, the far side's 48 kHz
-        // voice was resampled down to 16 kHz on its way into the video.
-        // Measured on the 2026-08-11 call: 16000 Hz in the mp4 against 48000
-        // on the day the cleaned track was declined.
-        let both = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: "m.aec.m4a", sysPath: "y.m4a",
-                                           micOffset: 0.1, sysOffset: 0, outPath: "o.mp4")
-        XCTAssertEqual(value(after: "-ar", in: both), "48000")
-
-        // Every shape of the graph, including the one with no filter at all.
-        let micOnly = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: "m.m4a", sysPath: nil,
-                                              micOffset: 0, sysOffset: 0, outPath: "o.mp4")
-        XCTAssertFalse(micOnly.contains("-filter_complex"))
-        XCTAssertEqual(value(after: "-ar", in: micOnly), "48000")
-
-        let sysShifted = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: nil, sysPath: "y.m4a",
-                                                 micOffset: 0, sysOffset: -0.5, outPath: "o.mp4")
-        XCTAssertEqual(value(after: "-ar", in: sysShifted), "48000")
+        // its FIRST input's rate, so a 48 kHz system track was mixed down to
+        // 16 kHz. Resampling the OUTPUT does not undo that — measured on the
+        // 2026-08-11 call, 8-12 kHz came out 23 dB down and 12-20 kHz 50 dB
+        // down against the source. Each input must reach amix at 48 kHz.
+        for (mic, sys) in [("m.aec.m4a", "y.m4a"), ("m.aec.m4a", nil), (nil, "y.m4a")] as [(String?, String?)] {
+            let args = AudioMuxer.buildMuxArgs(screenPath: "s.mp4", micPath: mic, sysPath: sys,
+                                               micOffset: 0.1, sysOffset: 0, outPath: "o.mp4")
+            let filter = value(after: "-filter_complex", in: args)!
+            let inputs = [mic, sys].compactMap { $0 }.count
+            XCTAssertEqual(filter.components(separatedBy: "aresample=48000").count - 1, inputs, filter)
+            if let amix = filter.range(of: "amix") {
+                // No input reaches the mixer without passing a resampler first.
+                XCTAssertFalse(filter[..<amix.lowerBound].contains("[1:a]amix"), filter)
+            }
+            XCTAssertEqual(value(after: "-ar", in: args), "48000")
+        }
     }
 
 }
