@@ -356,6 +356,21 @@ class Transcriber {
         }
     }
 
+    /// A silence longer than this between two utterances of the SAME speaker
+    /// starts a fresh line with its own timestamp instead of extending the run.
+    /// Without it, one participant monologuing while the other stays quiet
+    /// collapses into a single wall-of-text paragraph under one timestamp — a
+    /// real 30-minute daily on 2026-08-11 rendered as 7 lines, one of them a
+    /// solid 9-minute block.
+    ///
+    /// 5 s, measured rather than guessed: `silencedetect` over that call's
+    /// far-end track found 2 silences of 20 s, 3 of 10 s, but 23 of 5 s — so a
+    /// 20 s rule would have left the 9-minute block almost intact, while 5 s
+    /// yields a fresh timestamp roughly every 75 s. It cannot fragment ordinary
+    /// dialogue: a change of speaker already ends a line, so this only ever
+    /// splits one person talking to themselves for a while.
+    static let sameSpeakerGapBreakMs = 5_000
+
     static func dialogueTranscript(mic: [TranscriptSegment], system: [TranscriptSegment]) -> String {
         var tagged = mic.map { (seg: $0, speaker: "Я") } + system.map { (seg: $0, speaker: "Собеседник") }
         tagged.sort { $0.seg.fromMs < $1.seg.fromMs }
@@ -364,14 +379,18 @@ class Transcriber {
         var lines: [String] = []
         var curSpeaker = tagged[0].speaker
         var curStart = tagged[0].seg.fromMs
+        var curEnd = tagged[0].seg.toMs
         var curText = tagged[0].seg.text
         for entry in tagged.dropFirst() {
-            if entry.speaker == curSpeaker {
+            let gap = entry.seg.fromMs - curEnd
+            if entry.speaker == curSpeaker && gap <= Self.sameSpeakerGapBreakMs {
                 curText += " " + entry.seg.text
+                curEnd = max(curEnd, entry.seg.toMs)
             } else {
                 lines.append(formatDialogueLine(startMs: curStart, speaker: curSpeaker, text: curText))
                 curSpeaker = entry.speaker
                 curStart = entry.seg.fromMs
+                curEnd = entry.seg.toMs
                 curText = entry.seg.text
             }
         }

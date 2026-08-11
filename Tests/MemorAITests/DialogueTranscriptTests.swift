@@ -63,6 +63,74 @@ final class DialogueTranscriptTests: XCTestCase {
         """)
     }
 
+    func testLongPauseBreaksSameSpeakerIntoNewTimestampedLine() {
+        // A monologue with a silence past the threshold: the second utterance
+        // gets its own line and timestamp instead of extending the first.
+        let gap = Transcriber.sameSpeakerGapBreakMs + 1000
+        let mic = [seg(0, 2000, "Начинаю."),
+                   seg(2000 + gap, 2000 + gap + 1000, "Продолжаю.")]
+        let out = Transcriber.dialogueTranscript(mic: mic, system: [])
+        XCTAssertEqual(out, """
+        [00:00] Я: Начинаю.
+        [00:08] Я: Продолжаю.
+
+        """)
+    }
+
+    func testAMonologueGetsATimestampPerPauseInsteadOfOneWall() {
+        // The case this exists for: 30 minutes of one speaker with the other
+        // silent. Pauses are what make it seekable — every one of them must
+        // produce its own line, not just the rare very long ones.
+        let pause = Transcriber.sameSpeakerGapBreakMs + 500
+        var segs: [TranscriptSegment] = []
+        var t = 0
+        for i in 0..<5 {
+            segs.append(seg(t, t + 30_000, "блок\(i)"))
+            t += 30_000 + pause
+        }
+        let out = Transcriber.dialogueTranscript(mic: [], system: segs)
+        XCTAssertEqual(out.split(separator: "\n").count, 5, out)
+        XCTAssertTrue(out.hasPrefix("[00:00] Собеседник: блок0\n[00:35] Собеседник: блок1"), out)
+    }
+
+    func testPauseUnderThresholdStillGroups() {
+        // One millisecond short of the break: the run stays a single line.
+        let gap = Transcriber.sameSpeakerGapBreakMs - 1
+        let mic = [seg(0, 2000, "Раз."),
+                   seg(2000 + gap, 2000 + gap + 1000, "Два.")]
+        let out = Transcriber.dialogueTranscript(mic: mic, system: [])
+        XCTAssertEqual(out, """
+        [00:00] Я: Раз. Два.
+
+        """)
+    }
+
+    func testBreakDoesNotDisruptSpeakerInterleaving() {
+        // A break inside one speaker's run must not swallow the other speaker's
+        // reply that lands in the gap.
+        let mic = [seg(0, 2000, "Первое."),
+                   seg(60_000, 62_000, "Третье.")]
+        let system = [seg(30_000, 31_000, "Второе.")]
+        let out = Transcriber.dialogueTranscript(mic: mic, system: system)
+        XCTAssertEqual(out, """
+        [00:00] Я: Первое.
+        [00:30] Собеседник: Второе.
+        [01:00] Я: Третье.
+
+        """)
+    }
+
+    func testOverlappingSameSpeakerSegmentsDoNotBreak() {
+        // Negative/zero gaps (segments overlap) are not a pause; keep grouping.
+        let mic = [seg(0, 5000, "Начало"),
+                   seg(3000, 6000, "перекрытие")]
+        let out = Transcriber.dialogueTranscript(mic: mic, system: [])
+        XCTAssertEqual(out, """
+        [00:00] Я: Начало перекрытие
+
+        """)
+    }
+
     func testEmptyInputProducesEmptyString() {
         XCTAssertEqual(Transcriber.dialogueTranscript(mic: [], system: []), "")
     }
