@@ -225,6 +225,9 @@ class Transcriber {
             let jsonURL = outBase.appendingPathExtension("json")
             let result = runProcess(whisperExec, args: [
                 "-m", modelFile, "-l", lang,
+                // Two threads, not all of them: even gated out of live calls,
+                // whisper shares the machine with whatever the user is doing.
+                "-t", "2",
                 "-et", "2.2", "-lpt", "-0.5",
                 "-oj", "-of", outBase.path,
                 chunkWav.path
@@ -474,6 +477,9 @@ class Transcriber {
             let tmpBase = dir.appendingPathComponent("_whisper_tmp")
             let result = runProcess(whisperExec, args: [
                 "-m", modelFile, "-l", lang,
+                // Two threads, not all of them: even gated out of live calls,
+                // whisper shares the machine with whatever the user is doing.
+                "-t", "2",
                 "-et", "2.2", "-lpt", "-0.5",
                 "-otxt", "-of", tmpBase.path,
                 mergedWav.path
@@ -660,70 +666,17 @@ class Transcriber {
         let stderr: String
     }
 
-    /// Run a subprocess with an optional timeout. On timeout the process is terminated
-    /// and exit code -2 is returned.
+    /// Run a subprocess as post-processing work: background priority, and
+    /// cancellable the moment a recording starts.
+    ///
+    /// This used to be a second, hand-rolled copy of ProcessRunner — which
+    /// meant lowering the priority of "our subprocesses" in one place quietly
+    /// missed whisper, the heaviest of them all. One runner, one place to
+    /// change.
     private func runProcess(_ path: String, args: [String], timeout: TimeInterval? = nil) -> ProcessResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        // Drain both pipes as data arrives so the child never blocks on a full
-        // pipe buffer (ffmpeg's stderr stats exceed 64 KB on long inputs).
-        var stdoutData = Data()
-        var stderrData = Data()
-        let ioQueue = DispatchQueue(label: "com.local.memorai.process-io")
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            ioQueue.async { stdoutData.append(chunk) }
-        }
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            ioQueue.async { stderrData.append(chunk) }
-        }
-
-        do {
-            try process.run()
-        } catch {
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
-            return ProcessResult(exitCode: -1, stdout: "", stderr: error.localizedDescription)
-        }
-
-        let deadline = timeout ?? processTimeout
-        var timedOut = false
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + deadline)
-        timer.setEventHandler {
-            if process.isRunning {
-                timedOut = true
-                process.terminate()
-            }
-        }
-        timer.resume()
-
-        process.waitUntilExit()
-        timer.cancel()
-
-        // Stop handlers, then collect any remaining buffered bytes synchronously.
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-        let finalOut = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let finalErr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        let (outData, errData): (Data, Data) = ioQueue.sync {
-            (stdoutData + finalOut, stderrData + finalErr)
-        }
-
-        let stdout = String(data: outData, encoding: .utf8) ?? ""
-        let stderr = String(data: errData, encoding: .utf8) ?? ""
-        let exitCode: Int32 = timedOut ? -2 : process.terminationStatus
-        if timedOut {
-            log("[Transcriber] ⏱ Process timed out after \(Int(deadline))s: \((path as NSString).lastPathComponent)")
-        }
-        return ProcessResult(exitCode: exitCode, stdout: stdout, stderr: stderr)
+        let result = ProcessRunner.run(path, args: args,
+                                       timeout: timeout ?? processTimeout,
+                                       role: .postProcessing)
+        return ProcessResult(exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr)
     }
 }

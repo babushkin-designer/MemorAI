@@ -66,6 +66,27 @@ or crashing mid-pipeline only costs the stage in flight; the next launch calls
 `resumeUnfinishedSessions()` and finishes the rest. Quit waits for the writers
 only — never for ffmpeg or whisper.
 
+Post-processing NEVER runs while a recording is in progress. The gate closes
+before the recorders start (`PostProcessor.setRecordingActive`), terminates the
+child process in flight, and reopens 15 s after the session stops; the deferred
+session is picked back up off its manifest. Whisper on the GPU plus the AEC
+sidecar on top of a live call is what made the speakers crackle mid-conversation
+(measured 2026-08-19: whisper 08:17:53–08:25:41 across a call recorded
+08:20:12–08:33:34). A stage cut short must NOT be recorded as done — an
+interrupted AEC otherwise passes for "declined" and the call keeps the raw mic
+forever. Post-processing children run through `ProcessRunner` with
+`role: .postProcessing` (utility QoS + nice 10, cancellable as a group);
+`.background` was measured at 2.6x slower and is not worth it now that the gate
+removes the overlap. Screen memory + OCR and dictation (its third audio engine
+and resident whisper-server) also stand down for the duration of a call.
+
+`AudioGlitchMonitor` is the instrument for all of this: it counts
+`kAudioDeviceProcessorOverload` on the default output/input while recording and
+stamps each event with the stage to blame, and it photographs (read-only, never
+sets) buffer frame size / sample rate around each recorder's start and stop.
+`tools/glitch-probe.sh` is the causal test — it SIGSTOPs the heavy children for
+a few seconds mid-crackle and resumes them.
+
 Invariants worth not breaking:
 - `call_<tag>_mic.m4a` appears only when it holds the WHOLE track. A failed
   stitch leaves it absent and the parts on disk; downstream then honestly runs

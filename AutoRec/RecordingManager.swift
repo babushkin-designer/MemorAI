@@ -89,6 +89,18 @@ class RecordingManager {
         manifest.save(in: baseDir)
         self.currentManifest = manifest
 
+        // Instrumentation: count the IO deadlines the machine misses while we
+        // record, and photograph the shared device parameters at every step, so
+        // "the speakers crackle during a call" becomes a number attributable to
+        // a specific stage instead of an impression.
+        AudioGlitchMonitor.shared.start(context: "recording (\(source))")
+        AudioGlitchMonitor.shared.snapshot("before recorders")
+
+        // Close the gate BEFORE the recorders come up, and cancel whatever the
+        // pipeline is already running: the call must not share the machine with
+        // whisper or the AEC sidecar.
+        PostProcessor.shared.setRecordingActive(true, dir: baseDir)
+
         startTask = Task {
             do {
                 let sysRec = SystemAudioRecorder(audioURL: sysURL, videoURL: vidURL)
@@ -106,6 +118,7 @@ class RecordingManager {
                 }
                 self.systemAudioRecorder = sysRec
                 try await sysRec.start()
+                AudioGlitchMonitor.shared.snapshot("after SCStream start")
 
                 let micRec = MicRecorder(outputURL: micURL)
                 micRec.onSilenceChanged = { [weak self] silent in
@@ -122,6 +135,10 @@ class RecordingManager {
                 }
                 self.micRecorder = micRec
                 try micRec.start()
+                // If our second input client reconfigures the shared devices,
+                // this snapshot differs from the one above — that is the whole
+                // question, answered by measurement.
+                AudioGlitchMonitor.shared.snapshot("after mic engine start")
 
                 setState(.recording)
                 log("[RecordingManager] All recorders running")
@@ -134,6 +151,8 @@ class RecordingManager {
                 // Nothing was recorded, so there is nothing to post-process.
                 if let dir = currentBaseDir { currentManifest?.remove(in: dir) }
                 currentManifest = nil
+                PostProcessor.shared.setRecordingActive(false, dir: baseDir)
+                AudioGlitchMonitor.shared.stop()
                 setState(.idle)
                 onRecordingActiveChanged?(false)
             }
@@ -182,7 +201,13 @@ class RecordingManager {
             // startup task then brings the session up with nobody left to stop it.
             await startTask?.value
             micRecorder?.stop()
+            AudioGlitchMonitor.shared.snapshot("after mic engine stop")
             await systemAudioRecorder?.stop()
+            AudioGlitchMonitor.shared.snapshot("after SCStream stop")
+            AudioGlitchMonitor.shared.stop()
+            // Recorders are down: the pipeline may have the machine back, and
+            // anything deferred while the call ran gets picked up off disk.
+            PostProcessor.shared.setRecordingActive(false, dir: baseDir)
             // Track start times (host clock) — AudioMuxer aligns the three
             // files with these; grab them before the recorders are released.
             let micStart = micRecorder?.firstBufferHostSeconds

@@ -158,7 +158,7 @@ class EchoCanceller {
             let result = ProcessRunner.run(ffmpegPath,
                                            args: Self.buildDecodeArgs(inputPath: source.path,
                                                                       outPath: target.path),
-                                           timeout: 300)
+                                           timeout: 300, role: .postProcessing)
             guard result.exitCode == 0 else {
                 log("[EchoCanceller] ❌ Decoding \(source.lastPathComponent) failed: \(result.stderrTail)")
                 return nil
@@ -172,7 +172,7 @@ class EchoCanceller {
                                                                 lpbWav: lpbWav.path,
                                                                 outWav: cleanWav.path,
                                                                 modelPrefix: Self.modelPrefix),
-                                    timeout: 3600)
+                                    timeout: 3600, role: .postProcessing)
         guard run.exitCode == 0, let metrics = Self.parseMetrics(run.stdout) else {
             log("[EchoCanceller] ❌ Sidecar failed (exit \(run.exitCode)): \(run.stderrTail)")
             return nil
@@ -189,7 +189,7 @@ class EchoCanceller {
         let encode = ProcessRunner.run(ffmpegPath,
                                        args: Self.buildEncodeArgs(inputPath: cleanWav.path,
                                                                   outPath: cleanURL.path),
-                                       timeout: 600)
+                                       timeout: 600, role: .postProcessing)
         guard encode.exitCode == 0 else {
             log("[EchoCanceller] ❌ Encoding cleaned mic failed: \(encode.stderrTail)")
             try? fm.removeItem(at: cleanURL)

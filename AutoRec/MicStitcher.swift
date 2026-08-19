@@ -177,7 +177,7 @@ class MicStitcher {
 
         // This runs before the stop completion, which on quit is what lets the
         // process exit — so it needs a deadline, not an open-ended wait.
-        let result = ProcessRunner.run(ffmpegPath, args: args, timeout: 900)
+        let result = ProcessRunner.run(ffmpegPath, args: args, timeout: 900, role: .postProcessing)
         guard result.exitCode == 0 else {
             let why = result.timedOut ? "timed out" : "exit \(result.exitCode)"
             log("[MicStitcher] ❌ ffmpeg failed (\(why)): \(result.stderrTail)")

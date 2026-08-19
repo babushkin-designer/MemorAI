@@ -65,6 +65,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 if self.settings.autoDetect { self.callDetector.exitRecordingMode() }
             }
+            // Everything else this app does that costs real CPU stands down for
+            // the duration of a call: the screenshot loop with its OCR sidecar,
+            // and dictation with its resident whisper model.
+            self.screenMemory?.setCallActive(active)
+            self.dictation?.setCallActive(active)
         }
         recordingManager.onSilenceChanged = { [weak self] silent in
             self?.callDetector.reportSystemAudioSilence(silent)

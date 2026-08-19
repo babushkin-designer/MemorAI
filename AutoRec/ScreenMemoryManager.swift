@@ -30,6 +30,23 @@ class ScreenMemoryManager {
     /// a minute), so the tick is skipped until the screen is back.
     private var screenOff = false
 
+    /// Set while a call is being recorded. Screenshots are cheap, but the OCR
+    /// sidecar behind them is not, and a call is the one time the machine has
+    /// a hard real-time deadline to meet. The frames are not worth a crackling
+    /// conversation — the call has its own screen recording anyway.
+    private var callPaused = false
+
+    func setCallActive(_ active: Bool) {
+        guard callPaused != active else { return }
+        callPaused = active
+        if active {
+            log("[ScreenMemory] paused (call recording)")
+        } else {
+            lastSavedHash = 0  // the screen moved on while we were not looking
+            log("[ScreenMemory] resumed (call ended)")
+        }
+    }
+
     func start() {
         guard !isRunning else { return }
         let settings = SettingsManager.shared
@@ -106,6 +123,7 @@ class ScreenMemoryManager {
 
         guard settings.screenMemoryEnabled else { return }
         guard !screenOff else { return }
+        guard !callPaused else { return }
 
         // Skip while the user is idle (no input), even if the screen is changing.
         let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState,

@@ -60,6 +60,12 @@ class DictationManager {
     private var serverModel: String?
     private var idleShutdownWork: DispatchWorkItem?
 
+    /// Set while a call is being recorded. Dictation is a THIRD audio engine on
+    /// the same input device plus a resident whisper model, and a call already
+    /// has two recorders and a hard real-time deadline. Its fn-tap is ignored
+    /// for the duration and the warm server is released.
+    private var callActive = false
+
     private let workQueue = DispatchQueue(label: "com.local.memorai.dictation", qos: .userInitiated)
 
     /// Persistent dictation history (menu re-copy; never lose text if paste misses).
@@ -134,7 +140,27 @@ class DictationManager {
 
     // MARK: - Toggle flow
 
+    /// Called when a call recording starts and stops.
+    func setCallActive(_ active: Bool) {
+        guard callActive != active else { return }
+        callActive = active
+        guard active else {
+            log("[Dictation] Enabled again (call ended)")
+            return
+        }
+        // Mid-dictation when the call starts: finish it rather than throw the
+        // text away — the user is holding it in their head, not on disk.
+        if state == .listening { stopListeningAndTranscribe() }
+        stopServer()
+        log("[Dictation] Disabled while a call records (whisper-server released)")
+    }
+
     func toggle() {
+        if callActive, state == .idle {
+            log("[Dictation] Ignored — a call is being recorded")
+            NSSound(named: "Basso")?.play()
+            return
+        }
         switch state {
         case .idle: startListening()
         case .listening: stopListeningAndTranscribe()
