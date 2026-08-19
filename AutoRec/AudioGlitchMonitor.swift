@@ -122,8 +122,11 @@ final class AudioGlitchMonitor {
                 let name = Self.deviceName(id)
                 let frames = Self.uint32Property(id, kAudioDevicePropertyBufferFrameSize)
                 let rate = Self.doubleProperty(id, kAudioDevicePropertyNominalSampleRate)
-                let safety = Self.uint32Property(id, kAudioDevicePropertySafetyOffset)
-                let latency = Self.uint32Property(id, kAudioDevicePropertyLatency)
+                // Safety offset and latency exist per direction, not globally:
+                // asked for in the global scope they simply come back missing.
+                let scope = role == "input" ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput
+                let safety = Self.uint32Property(id, kAudioDevicePropertySafetyOffset, scope: scope)
+                let latency = Self.uint32Property(id, kAudioDevicePropertyLatency, scope: scope)
                 log("[AudioGlitch] \(label) — \(role): \(name), buffer \(frames.map(String.init) ?? "?") frames, "
                     + "\(rate.map { String(format: "%.0f", $0) } ?? "?")Hz, safety \(safety.map(String.init) ?? "?"), "
                     + "latency \(latency.map(String.init) ?? "?")")
@@ -237,16 +240,20 @@ final class AudioGlitchMonitor {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var name: CFString = "" as CFString
-        var size = UInt32(MemoryLayout<CFString>.size)
+        // The HAL hands back a +1 reference; taking it as Unmanaged is what
+        // lets ARC balance it instead of leaking one string per snapshot.
+        var name: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let status = AudioObjectGetPropertyData(id, &address, 0, nil, &size, &name)
-        return status == noErr ? (name as String) : "device \(id)"
+        guard status == noErr, let value = name?.takeRetainedValue() else { return "device \(id)" }
+        return value as String
     }
 
-    private static func uint32Property(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
+    private static func uint32Property(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                                       scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> UInt32? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
+            mScope: scope,
             mElement: kAudioObjectPropertyElementMain
         )
         var value: UInt32 = 0
