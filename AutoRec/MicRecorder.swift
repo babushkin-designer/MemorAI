@@ -88,6 +88,14 @@ class MicRecorder {
     private var _firstBufferHostSeconds: Double?
     private var _lastBufferTime: Date?
     private var _bufferCount: UInt64 = 0
+    /// Where the next tap callback should start, from the last one's host time
+    /// plus its own length. A callback that starts later than that is input the
+    /// engine did not deliver — the mic-side twin of an output dropout, and the
+    /// only cheap way to see one without logging from the audio thread.
+    private var _expectedNextHost: Double?
+    private var _tapGaps = 0
+    private var _tapGapSeconds = 0.0
+    private var _tapMaxGapSeconds = 0.0
     private var _writeErrorCount = 0
     /// Set once the tap has asked for recovery, so a tap that keeps failing
     /// posts exactly one event instead of one per buffer.
@@ -195,14 +203,18 @@ class MicRecorder {
         engine?.stop()
         engine = nil
 
-        let (count, segmentCount) = lock.withLock { () -> (UInt64, Int) in
+        let (count, segmentCount, gaps, gapSeconds, maxGap) = lock.withLock { () -> (UInt64, Int, Int, Double, Double) in
             closeCurrentSegmentLocked()
             _silenceStart = nil
             _isSilent = false
-            return (_bufferCount, _segments.count)
+            return (_bufferCount, _segments.count, _tapGaps, _tapGapSeconds, _tapMaxGapSeconds)
         }
         let extra = segmentCount > 1 ? " in \(segmentCount) segments" : ""
         log("[MicRecorder] Recording stopped (\(count) buffers total\(extra))")
+        if gaps > 0 {
+            log(String(format: "[MicRecorder] Tap health — %d late callback(s), %.3fs unaccounted, max %.3fs",
+                       gaps, gapSeconds, maxGap))
+        }
     }
 
     /// AVFAudio raises ObjC exceptions on some device-transition failures
@@ -261,6 +273,7 @@ class MicRecorder {
             if let file = _audioFile,
                file.processingFormat.sampleRate != nativeSampleRate
                 || file.processingFormat.channelCount != nativeChannels {
+                _expectedNextHost = nil
                 notices.append("[MicRecorder] Input format changed mid-recording (\(Int(file.processingFormat.sampleRate))Hz/\(file.processingFormat.channelCount)ch → \(Int(nativeSampleRate))Hz/\(nativeChannels)ch) — continuing in a new segment")
                 rollToNextSegmentLocked()
             }
@@ -323,6 +336,21 @@ class MicRecorder {
             guard _isRecording, !_isPaused else { return }
             _lastBufferTime = Date()
             _bufferCount &+= 1
+            if when.isHostTimeValid {
+                let hostSeconds = AVAudioTime.seconds(forHostTime: when.hostTime)
+                let length = buffer.format.sampleRate > 0
+                    ? Double(buffer.frameLength) / buffer.format.sampleRate
+                    : 0
+                if let expected = _expectedNextHost {
+                    let gap = hostSeconds - expected
+                    if gap > max(length, 0.005) {
+                        _tapGaps += 1
+                        _tapGapSeconds += gap
+                        _tapMaxGapSeconds = max(_tapMaxGapSeconds, gap)
+                    }
+                }
+                if length > 0 { _expectedNextHost = hostSeconds + length }
+            }
             if _currentSegmentFirstHost == nil, when.isHostTimeValid {
                 let hostSeconds = AVAudioTime.seconds(forHostTime: when.hostTime)
                 _currentSegmentFirstHost = hostSeconds
