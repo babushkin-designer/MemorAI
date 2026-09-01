@@ -155,9 +155,6 @@ class ScreenMemoryManager {
         let shouldSave = distance > hashThreshold || appChanged || keyThreshold
         guard shouldSave else { return }
 
-        lastSavedHash = currentHash
-        keyPressCount = 0
-
         let now = Date()
         let dayFormatter = DateFormatter()
         dayFormatter.dateFormat = "yyyy-MM-dd"
@@ -175,7 +172,15 @@ class ScreenMemoryManager {
 
         let meta = metadata.collect()
         let savedURL = capturer.saveImage(image, to: imageURL)
-        guard let savedURL = savedURL else { return }
+        guard let savedURL = savedURL else {
+            // Both of these say "this frame is on disk". Setting them before
+            // the write meant a failed save left the screen looking already
+            // captured, and nothing was kept until the screen changed again.
+            log("[ScreenMemory] ❌ Could not write \(imageURL.lastPathComponent) — will try again next tick")
+            return
+        }
+        lastSavedHash = currentHash
+        keyPressCount = 0
 
         var baseRecord = meta
         baseRecord["timestamp"] = ISO8601DateFormatter().string(from: now)
