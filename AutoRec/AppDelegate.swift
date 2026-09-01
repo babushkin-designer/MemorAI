@@ -14,6 +14,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         screenMemory.stop()
         dictation?.shutdown()
+        // whisper, ffmpeg and the AEC sidecar are ours; without this they
+        // outlive the app and keep working for a parent that is gone. Every
+        // stage they were in is recorded in the manifest and resumed at the
+        // next launch, so stopping them costs nothing.
+        ProcessRunner.cancelPostProcessing(reason: "quitting")
         let state = recordingManager?.state ?? .idle
         guard state == .recording || state == .starting || state == .paused || state == .stopping else {
             return .terminateNow

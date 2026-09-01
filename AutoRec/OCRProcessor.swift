@@ -140,6 +140,14 @@ class OCRProcessor {
         }
     }
 
+    /// Stop the resident sidecar. Nothing did this on quit, so the Python
+    /// process outlived the app that spawned it and kept a core busy (seen
+    /// 2026-09-01, alongside an orphaned AEC sidecar). Synchronous on purpose:
+    /// on the way out there is no later.
+    func shutdown() {
+        queue.sync { self.teardownSidecar() }
+    }
+
     private func teardownSidecar() {
         sidecar?.terminate()
         sidecar = nil
