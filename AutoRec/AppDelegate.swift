@@ -469,6 +469,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             sub.addItem(.separator())
+            if let url = session.transcriptURL {
+                let copyPath = NSMenuItem(title: "📋 Copy Transcript Path",
+                                          action: #selector(copyPathToClipboard(_:)), keyEquivalent: "")
+                copyPath.target = self
+                copyPath.representedObject = url
+                sub.addItem(copyPath)
+            }
             let reveal = NSMenuItem(title: "Show in Finder", action: #selector(revealCallInFinder(_:)), keyEquivalent: "")
             reveal.target = self
             reveal.representedObject = session.videoURL ?? session.transcriptURL ?? session.micURL ?? session.systemURL
@@ -501,6 +508,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openFileURL(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    /// The plain POSIX path, which is what gets pasted into a chat. Writing a
+    /// file URL alongside it would make some apps paste the file itself.
+    @objc private func copyPathToClipboard(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.path, forType: .string)
+        log("[Menu] Copied path to clipboard: \(url.lastPathComponent)")
     }
 
     // MARK: - LLM actions (summary / follow-up)
