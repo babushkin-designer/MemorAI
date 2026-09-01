@@ -8,7 +8,7 @@ personal fork; do not push to any remote.
 ## Build / verify
 
 - `swift build` — the primary gate (repo root). ~10 s warm.
-- `swift test` — 144 tests; must stay offline and must never touch the real
+- `swift test` — 156 tests; must stay offline and must never touch the real
   data dir (fixture dirs only). ffmpeg/AEC-dependent tests skip themselves
   where those are not installed.
 - `bash bundle.sh` — builds MemorAI.app and codesigns it (stable identity so
@@ -137,6 +137,17 @@ Invariants worth not breaking:
 - Subprocess calls must drain stdout/stderr concurrently (pipe-buffer
   deadlock; see Transcriber.runProcess) — reuse `runProcess`, don't add raw
   `waitUntilExit`-then-read code.
+- Every child has to be taken down on quit. `applicationShouldTerminate`
+  cancels the `.postProcessing` group and stops the OCR sidecar; without that
+  they outlive the app (seen 2026-09-01: an AEC and an OCR sidecar still
+  running after the app was gone). A new resident sidecar needs the same.
+- Nothing may claim a capture is kept before it is on disk. ClipboardMonitor
+  advances `lastChangeCount` only after the append succeeds, so a failed write
+  is retried on the next poll instead of skipped forever; the append throws
+  (and catches JSONSerialization's ObjC *raise*) rather than swallowing.
+- Durations come from the container header — `ffmpeg -i file` with no output.
+  `-f null -` decodes the whole track; on a 4-hour call it just burned the
+  timeout and then parsed the same header line anyway.
 - macOS TCC: Screen Recording / Microphone / Accessibility permissions are
   tied to the codesign identity; ad-hoc signing resets them on every rebuild —
   bundle.sh handles this, don't bypass it.
