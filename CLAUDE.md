@@ -8,7 +8,7 @@ personal fork; do not push to any remote.
 ## Build / verify
 
 - `swift build` — the primary gate (repo root). ~10 s warm.
-- `swift test` — 139 tests; must stay offline and must never touch the real
+- `swift test` — 144 tests; must stay offline and must never touch the real
   data dir (fixture dirs only). ffmpeg/AEC-dependent tests skip themselves
   where those are not installed.
 - `bash bundle.sh` — builds MemorAI.app and codesigns it (stable identity so
@@ -57,6 +57,18 @@ is written or the session is given up on). `_mic.aec.m4a` IS data —
 the echo-cancelled mic, kept next to the raw one.
 
 ## Call pipeline
+
+Where one recording ends: CallDetector polls which OTHER processes hold the
+mic. A free mic while system audio plays used to keep recording — Electron call
+apps release the mic on mute, and the far side is still worth having. That rule
+is now scoped to the app that was holding the mic (`kAudioProcessPropertyIs`
+`RunningOutput` on the same per-process API): the far side through Pachca keeps
+the session, Spotify after the meeting does not, and back-to-back calls land in
+separate files. Threshold `CallDetector.splitAfterCallAppQuiet` (180 s) is a
+starting point, NOT a measurement — every mic release and re-acquisition is
+logged with its duration so it can be set from real calls. Before this, one
+session ran 07:12–11:38 UTC on 2026-09-01: four meetings, five mic releases, one
+4.4-hour transcript.
 
 Recording: SystemAudioRecorder writes `_system.m4a` + `_screen.mp4`;
 MicRecorder writes `_mic.part<N>` segments (a new one on every engine restart —
