@@ -493,57 +493,17 @@ class DictationManager {
         }
     }
 
-    // MARK: - Subprocess helper (drains pipes; see Transcriber.runProcess)
+    // MARK: - Subprocess helper
 
-    private struct ProcessResult {
-        let exitCode: Int32
-        let stderr: String
-    }
-
-    private func runProcess(_ path: String, args: [String], timeout: TimeInterval) -> ProcessResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-
-        let stderrPipe = Pipe()
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = stderrPipe
-
-        var stderrData = Data()
-        let ioQueue = DispatchQueue(label: "com.local.memorai.dictation-io")
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            ioQueue.async { stderrData.append(chunk) }
-        }
-
-        do {
-            try process.run()
-        } catch {
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
-            return ProcessResult(exitCode: -1, stderr: error.localizedDescription)
-        }
-
-        var timedOut = false
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + timeout)
-        timer.setEventHandler {
-            if process.isRunning {
-                timedOut = true
-                process.terminate()
-            }
-        }
-        timer.resume()
-
-        process.waitUntilExit()
-        timer.cancel()
-
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-        let finalErr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData: Data = ioQueue.sync { stderrData + finalErr }
-
-        return ProcessResult(
-            exitCode: timedOut ? -2 : process.terminationStatus,
-            stderr: String(data: errData, encoding: .utf8) ?? ""
-        )
+    /// Deliberately `.foreground`, not `.postProcessing`. These children run
+    /// the user's own dictation, including the flush that happens the moment a
+    /// call starts — a role the recording gate refuses would throw away words
+    /// they just spoke. They are seconds of audio, not a four-hour call.
+    ///
+    /// This used to be a third hand-rolled copy of the runner (the second was
+    /// in Transcriber), and it had drifted: its timeout only sent SIGTERM, so a
+    /// whisper that ignored it held the queue forever.
+    private func runProcess(_ path: String, args: [String], timeout: TimeInterval) -> ProcessRunner.Result {
+        ProcessRunner.run(path, args: args, timeout: timeout, role: .foreground)
     }
 }

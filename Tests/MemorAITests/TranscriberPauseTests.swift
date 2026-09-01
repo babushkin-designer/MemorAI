@@ -106,6 +106,25 @@ final class TranscriberPauseTests: XCTestCase {
         XCTAssertEqual(left, [], "chunk cache outlived the transcript")
     }
 
+    /// Retention has to be able to reclaim a cache stranded by a quit during a
+    /// pause — nothing else will, and these names do not start with `call_`.
+    func testTheChunkCacheIsAKnownWorkFileWithAKnownSession() {
+        XCTAssertTrue(RetentionManager.isCallWorkFile("_whisper_2026-09-01_12-12-10_mic_3.json"))
+        XCTAssertTrue(RetentionManager.isCallWorkFile("_chunk_2026-09-01_12-12-10_system_0.wav"))
+        XCTAssertTrue(RetentionManager.isCallWorkFile("_track_2026-09-01_12-12-10_mic.wav"))
+        XCTAssertEqual(RetentionManager.transcriptionCacheTag("_whisper_2026-09-01_12-12-10_mic_3.json"),
+                       "2026-09-01_12-12-10")
+    }
+
+    /// And it must not mistake a recording for one — deleting those is the
+    /// user's call, never a timer's.
+    func testRecordingsAreNotWorkFiles() {
+        XCTAssertFalse(RetentionManager.isCallWorkFile("call_2026-09-01_12-12-10_mic.m4a"))
+        XCTAssertFalse(RetentionManager.isCallWorkFile("call_2026-09-01_12-12-10_transcript.txt"))
+        XCTAssertNil(RetentionManager.transcriptionCacheTag("_track_not-a-tag_mic.wav"))
+        XCTAssertNil(RetentionManager.transcriptionCacheTag("clipboard.jsonl"))
+    }
+
     /// Sweeping the cache must not touch the recordings it sits next to.
     func testDiscardPartialsRemovesOnlyItsOwnWorkFiles() throws {
         let dir = try makeDir()

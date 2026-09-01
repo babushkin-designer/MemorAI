@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import ObjCTry
 
 struct ClipboardEntry {
     let timestamp: Date
@@ -15,9 +14,18 @@ class ClipboardMonitor {
     /// have decided on purpose not to keep it. Advancing it first, as this used
     /// to, turned a failed append into a copy that never existed.
     private var lastChangeCount: Int = 0
-    /// The change count whose append last failed, so a disk that stays full
-    /// does not write the same complaint into the log every poll.
-    private var lastReportedFailure: Int = 0
+    /// Entries built but not yet on disk. A failed append used to leave the
+    /// change count where it was, which retried at the poll rate — twice a
+    /// second, rebuilding the record each time, re-encoding a copied image and
+    /// rewriting it before even attempting the append. They are held here
+    /// instead and flushed on a slow timer, so a full disk costs one attempt
+    /// every half minute and the copies survive until it clears.
+    private var pending: [[String: Any]] = []
+    private var retryAfter: Date?
+    private let retryInterval: TimeInterval = 30
+    /// Bounded: this is a fallback for a disk that is not writing, not a queue.
+    private let maxPending = 200
+    private var reportedFailure = false
     private var storageURL: URL?
     private let pasteboard = NSPasteboard.general
 
@@ -34,6 +42,9 @@ class ClipboardMonitor {
     /// Called periodically. Checks if clipboard changed and saves if so.
     func checkAndSave(excludedBundleIds: [String]) {
         guard let storage = storageURL else { return }
+        let logURL = storage.appendingPathComponent("clipboard.jsonl")
+        flushPending(to: logURL)
+
         let current = pasteboard.changeCount
         guard current != lastChangeCount else { return }
 
@@ -106,17 +117,23 @@ class ClipboardMonitor {
         entry["type"] = type
         entry["content"] = content
 
-        // Disk first. The in-memory buffer and the change count both stand for
-        // "this copy is kept", and neither may say so before it is true.
-        let logURL = storage.appendingPathComponent("clipboard.jsonl")
-        do {
-            try Self.append(entry, to: logURL)
-        } catch {
-            if lastReportedFailure != current {
-                lastReportedFailure = current
-                log("[Clipboard] ❌ Could not append to clipboard.jsonl: \(error.localizedDescription) — retrying")
+        // The change count says "this copy is kept". It may only move once the
+        // entry is on disk, or at least safely queued for it — advancing first
+        // turned a failed write into a copy that never existed.
+        if !pending.isEmpty {
+            hold(entry)
+        } else {
+            do {
+                try JSONLWriter.appendNow(entry, to: logURL)
+                reportedFailure = false
+            } catch {
+                if !reportedFailure {
+                    reportedFailure = true
+                    log("[Clipboard] ❌ Could not append to clipboard.jsonl: \(error.localizedDescription) — holding entries and retrying every \(Int(retryInterval))s")
+                }
+                hold(entry)
+                retryAfter = Date().addingTimeInterval(retryInterval)
             }
-            return   // change count untouched: the next poll tries this copy again
         }
         lastChangeCount = current
 
@@ -127,35 +144,32 @@ class ClipboardMonitor {
         }
     }
 
-    /// Append one JSON record as a line. Throws so the caller can keep the
-    /// entry pending instead of losing it.
-    static func append(_ entry: [String: Any], to logURL: URL) throws {
-        // JSONSerialization RAISES on a value it cannot encode instead of
-        // throwing, and an ObjC exception unwinding into Swift aborts the
-        // process. Everything put in here is a String today; a crash is still
-        // not the right answer if that ever stops being true.
-        var encoded: Data?
-        var swiftError: Error?
-        var raised: NSError?
-        let completed = MEMRunCatchingExceptions({
-            do { encoded = try JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) }
-            catch { swiftError = error }
-        }, &raised)
-        if let swiftError = swiftError { throw swiftError }
-        if !completed, let raised = raised { throw raised }
-        guard var data = encoded else {
-            throw NSError(domain: "MemorAI.Clipboard", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "entry could not be encoded"])
+
+    private func hold(_ entry: [String: Any]) {
+        pending.append(entry)
+        if pending.count > maxPending {
+            pending.removeFirst()
+            log("[Clipboard] ⚠️ Held entries exceeded \(maxPending) — dropped the oldest")
         }
-        data.append(0x0A)
-        guard FileManager.default.fileExists(atPath: logURL.path) else {
-            try data.write(to: logURL)
-            return
+    }
+
+    /// Retry the held entries, oldest first, no more than once per
+    /// `retryInterval`. Stops at the first failure so the order is kept.
+    private func flushPending(to logURL: URL) {
+        guard !pending.isEmpty else { return }
+        if let after = retryAfter, Date() < after { return }
+        while let entry = pending.first {
+            do {
+                try JSONLWriter.appendNow(entry, to: logURL)
+                pending.removeFirst()
+            } catch {
+                retryAfter = Date().addingTimeInterval(retryInterval)
+                return
+            }
         }
-        let handle = try FileHandle(forWritingTo: logURL)
-        defer { try? handle.close() }
-        try handle.seekToEnd()
-        try handle.write(contentsOf: data)
+        retryAfter = nil
+        reportedFailure = false
+        log("[Clipboard] Held entries written")
     }
 
     /// Load recent entries from clipboard.jsonl

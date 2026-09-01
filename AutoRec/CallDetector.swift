@@ -88,28 +88,30 @@ class CallDetector {
     func enterRecordingMode() {
         recordingMode = true
         recordingStartTime = Date()
-        systemAudioSilent = false
-        micSilent = false
-        systemAudioAvailable = true
-        callAppBundles = []
-        micFreeSince = nil
-        callAppQuietSince = nil
+        resetCallState()
         log("[CallDetector] Entered recording mode")
     }
 
     func exitRecordingMode() {
         recordingMode = false
         recordingStartTime = nil
+        resetCallState()
+        activeCount = 0
+        inactiveCount = 0
+        callActive = false
+        log("[CallDetector] Exited recording mode, resumed normal monitoring")
+    }
+
+    /// Everything that describes one recording. Reset in one place, so adding
+    /// a signal is one edit rather than two that half-work if the second is
+    /// forgotten.
+    private func resetCallState() {
         systemAudioSilent = false
         micSilent = false
         systemAudioAvailable = true
         callAppBundles = []
         micFreeSince = nil
         callAppQuietSince = nil
-        activeCount = 0
-        inactiveCount = 0
-        callActive = false
-        log("[CallDetector] Exited recording mode, resumed normal monitoring")
     }
 
     // MARK: - Informational callbacks (no-op for call-end, kept for logging / future use)
@@ -137,7 +139,11 @@ class CallDetector {
     // MARK: - Poll
 
     private func checkStatus() {
-        let foreign = foreignMicHolders()
+        // One enumeration per poll, shared by both questions asked of it —
+        // this is ~60 objects and two property reads each, over XPC to
+        // coreaudiod, every two seconds for the length of a call.
+        let objects = audioProcessObjects()
+        let foreign = foreignMicHolders(in: objects)
         let inCall = !foreign.isEmpty
 
         if inCall {
@@ -149,9 +155,9 @@ class CallDetector {
         }
 
         if recordingMode && inCall {
-            callAppBundles.formUnion(foreign.compactMap { holder in
-                executablePath(pid: holder.pid).map { Self.appBundleKey(for: $0) }
-            })
+            // The path is already resolved inside `foreignMicHolders`; carrying
+            // it saves a second `proc_pidpath` per holder per poll.
+            callAppBundles.formUnion(foreign.map { Self.appBundleKey(for: $0.path) })
             if let since = micFreeSince {
                 // The instrument for the threshold above: how long the mic
                 // actually sits free inside one meeting, versus between two.
@@ -181,7 +187,7 @@ class CallDetector {
             let now = Date()
             if recordingMode {
                 if micFreeSince == nil { micFreeSince = now }
-                if callAppsPlaying() {
+                if callAppsPlaying(in: objects) {
                     callAppQuietSince = nil
                 } else if callAppQuietSince == nil {
                     callAppQuietSince = now
@@ -192,8 +198,7 @@ class CallDetector {
             if Self.shouldStayInCall(recordingMode: recordingMode,
                                      systemAudioAvailable: systemAudioAvailable,
                                      systemAudioSilent: systemAudioSilent,
-                                     callAppQuietFor: quietFor,
-                                     splitAfter: Self.splitAfterCallAppQuiet) {
+                                     callAppQuietFor: quietFor) {
                 if inactiveCount == debounceCount {
                     let who = callAppQuietSince == nil ? "call app still playing" : "call app quiet"
                     log("[CallDetector] Mic released, \(who) — keeping recording")
@@ -218,10 +223,9 @@ class CallDetector {
     /// meeting rather than the far side of one.
     static func shouldStayInCall(recordingMode: Bool, systemAudioAvailable: Bool,
                                  systemAudioSilent: Bool,
-                                 callAppQuietFor: TimeInterval? = nil,
-                                 splitAfter: TimeInterval = .infinity) -> Bool {
+                                 callAppQuietFor: TimeInterval? = nil) -> Bool {
         guard recordingMode, systemAudioAvailable, !systemAudioSilent else { return false }
-        if let quiet = callAppQuietFor, quiet >= splitAfter { return false }
+        if let quiet = callAppQuietFor, quiet >= splitAfterCallAppQuiet { return false }
         return true
     }
 
@@ -229,9 +233,9 @@ class CallDetector {
     /// the user is muted this is the far side talking, and the only thing that
     /// separates "still in the meeting" from "the meeting ended and iTunes
     /// picked up where it left off".
-    private func callAppsPlaying() -> Bool {
+    private func callAppsPlaying(in objects: [AudioObjectID]) -> Bool {
         guard !callAppBundles.isEmpty else { return false }
-        for object in audioProcessObjects() {
+        for object in objects {
             guard processIsRunningOutput(object) else { continue }
             let pid = processPID(object)
             guard pid > 0, pid != ourPID,
@@ -253,6 +257,7 @@ class CallDetector {
 
     private struct ForeignMicHolder {
         let pid: pid_t
+        let path: String
         var label: String {
             if let app = NSRunningApplication(processIdentifier: pid),
                let name = app.localizedName ?? app.bundleIdentifier {
@@ -287,14 +292,14 @@ class CallDetector {
     }
 
     /// Enumerates audio process objects and returns ones (other than us) capturing mic input.
-    private func foreignMicHolders() -> [ForeignMicHolder] {
+    private func foreignMicHolders(in objects: [AudioObjectID]) -> [ForeignMicHolder] {
         var holders: [ForeignMicHolder] = []
-        for obj in audioProcessObjects() {
+        for obj in objects {
             guard processIsRunningInput(obj) else { continue }
             let pid = processPID(obj)
             guard pid > 0, pid != ourPID else { continue }
-            guard isUserFacingProcess(pid: pid) else { continue }
-            holders.append(ForeignMicHolder(pid: pid))
+            guard let path = executablePath(pid: pid), isUserFacingProcess(path: path) else { continue }
+            holders.append(ForeignMicHolder(pid: pid, path: path))
         }
         return holders
     }
@@ -311,8 +316,7 @@ class CallDetector {
     /// hold the mic for background OS features like Siri / dictation and should never be
     /// treated as call activity. Anything shipping from /System or /usr/libexec qualifies —
     /// except the known call daemons above (FaceTime has no user-space mic holder at all).
-    private func isUserFacingProcess(pid: pid_t) -> Bool {
-        guard let path = executablePath(pid: pid) else { return false }
+    private func isUserFacingProcess(path: String) -> Bool {
         if Self.isKnownCallDaemon(path) { return true }
         if path.hasPrefix("/System/") { return logFiltered(path) }
         if path.hasPrefix("/usr/libexec/") { return logFiltered(path) }

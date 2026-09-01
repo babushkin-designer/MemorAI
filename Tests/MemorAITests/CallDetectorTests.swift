@@ -40,14 +40,14 @@ final class CallDetectorTests: XCTestCase {
     func testMuteWithTheFarSideTalkingIsNeverSplit() {
         XCTAssertTrue(CallDetector.shouldStayInCall(
             recordingMode: true, systemAudioAvailable: true, systemAudioSilent: false,
-            callAppQuietFor: nil, splitAfter: 180))
+            callAppQuietFor: nil))
     }
 
     /// A short silence from the far side is a pause in the meeting, not its end.
     func testABriefQuietSpellIsNotASplit() {
         XCTAssertTrue(CallDetector.shouldStayInCall(
             recordingMode: true, systemAudioAvailable: true, systemAudioSilent: false,
-            callAppQuietFor: 179, splitAfter: 180))
+            callAppQuietFor: 179))
     }
 
     /// Music after the meeting: the Mac is not silent, so the old rule kept
@@ -56,14 +56,14 @@ final class CallDetectorTests: XCTestCase {
     func testMusicAfterTheMeetingEndsTheRecording() {
         XCTAssertFalse(CallDetector.shouldStayInCall(
             recordingMode: true, systemAudioAvailable: true, systemAudioSilent: false,
-            callAppQuietFor: 180, splitAfter: 180))
+            callAppQuietFor: CallDetector.splitAfterCallAppQuiet))
     }
 
     /// The split is scoped to a live recording — nothing to divide otherwise.
     func testQuietCallAppOutsideRecordingChangesNothing() {
         XCTAssertFalse(CallDetector.shouldStayInCall(
             recordingMode: false, systemAudioAvailable: true, systemAudioSilent: false,
-            callAppQuietFor: 600, splitAfter: 180))
+            callAppQuietFor: 600))
     }
 
     /// Callers that do not measure the call app's output get the old behaviour.

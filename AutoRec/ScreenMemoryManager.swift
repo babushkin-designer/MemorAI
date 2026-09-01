@@ -40,7 +40,11 @@ class ScreenMemoryManager {
         guard callPaused != active else { return }
         callPaused = active
         if active {
-            log("[ScreenMemory] paused (call recording)")
+            // Dictation releases its whisper-server for a call; the OCR model
+            // is the same kind of resident weight and does no work either way
+            // while the loop is paused. `ensureSidecar` brings it back after.
+            ocrProcessor.shutdown()
+            log("[ScreenMemory] paused (call recording, OCR sidecar released)")
         } else {
             lastSavedHash = 0  // the screen moved on while we were not looking
             log("[ScreenMemory] resumed (call ended)")
@@ -202,10 +206,14 @@ class ScreenMemoryManager {
         // "the contents changed" plus whatever is there now. Reading the change
         // count is a cheap IPC call and the contents are only read when it
         // moves, so the shorter interval costs close to nothing.
+        // Leeway so 172k wakeups a day can be coalesced with other timers —
+        // nothing here needs the tick to land on time, only to happen.
         let source = DispatchSource.makeTimerSource(queue: .main)
-        source.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        source.schedule(deadline: .now() + 0.5, repeating: 0.5, leeway: .milliseconds(100))
         source.setEventHandler { [weak self] in
             guard let self = self, self.isRunning, SettingsManager.shared.saveClipboard else { return }
+            // Read lazily: the settings lookup and its array allocation are
+            // only worth paying on the rare tick where the pasteboard moved.
             self.clipboard.checkAndSave(excludedBundleIds: SettingsManager.shared.excludedBundleIds)
         }
         source.resume()

@@ -360,10 +360,9 @@ class Transcriber {
     /// Every per-chunk record left over from an interrupted transcription of
     /// `tag`. Kept only between a pause and the resume that uses them.
     static func discardPartials(tag: String, in dir: URL) {
+        let prefixes = RetentionManager.transcriptionCachePrefixes(tag: tag)
         let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-        for name in names where name.hasPrefix("_whisper_\(tag)_")
-                             || name.hasPrefix("_chunk_\(tag)_")
-                             || name.hasPrefix("_track_\(tag)_") {
+        for name in names where prefixes.contains(where: name.hasPrefix) {
             try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
         }
     }

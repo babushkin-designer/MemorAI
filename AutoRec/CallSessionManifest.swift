@@ -81,6 +81,16 @@ struct CallSessionManifest: Codable {
         -> CallSessionManifest {
         var manifest = CallSessionManifest(tag: tag)
         manifest.micFile = mic?.lastPathComponent
+        // The echo-cancelled mic, when the original run produced one. Without
+        // this a retry transcribes the raw track while reusing chunks whisper
+        // made from the cleaned one — one transcript from two different mics.
+        if let mic = mic {
+            let cleaned = mic.deletingPathExtension()
+                .appendingPathExtension("aec").appendingPathExtension(mic.pathExtension)
+            if FileManager.default.fileExists(atPath: cleaned.path) {
+                manifest.cleanedMicFile = cleaned.lastPathComponent
+            }
+        }
         manifest.systemFile = system?.lastPathComponent
         manifest.screenFile = screen?.lastPathComponent
         manifest.recordingFinished = true

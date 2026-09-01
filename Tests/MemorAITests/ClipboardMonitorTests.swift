@@ -1,8 +1,8 @@
 import XCTest
 @testable import MemorAI
 
-/// A copy is only "kept" once it is on disk. The append has to report failure
-/// rather than swallow it, or the monitor advances past an entry it never wrote.
+/// A copy is only "kept" once it is on disk. The shared jsonl append has to
+/// report failure, or ClipboardMonitor advances past an entry it never wrote.
 final class ClipboardMonitorTests: XCTestCase {
 
     private func makeDir() throws -> URL {
@@ -17,8 +17,8 @@ final class ClipboardMonitorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("clipboard.jsonl")
 
-        try ClipboardMonitor.append(["content": "первая", "type": "text"], to: url)
-        try ClipboardMonitor.append(["content": "вторая", "type": "text"], to: url)
+        try JSONLWriter.appendNow(["content": "первая", "type": "text"], to: url)
+        try JSONLWriter.appendNow(["content": "вторая", "type": "text"], to: url)
 
         let lines = try String(contentsOf: url, encoding: .utf8)
             .components(separatedBy: "\n").filter { !$0.isEmpty }
@@ -30,7 +30,7 @@ final class ClipboardMonitorTests: XCTestCase {
     /// The signal the retry depends on: an append that cannot land must throw.
     func testAppendToAnUnwritablePathThrows() {
         let url = URL(fileURLWithPath: "/no/such/directory/clipboard.jsonl")
-        XCTAssertThrowsError(try ClipboardMonitor.append(["content": "x"], to: url))
+        XCTAssertThrowsError(try JSONLWriter.appendNow(["content": "x"], to: url))
     }
 
     /// Content that cannot be serialised must not take the file down with it.
@@ -38,9 +38,9 @@ final class ClipboardMonitorTests: XCTestCase {
         let dir = try makeDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("clipboard.jsonl")
-        try ClipboardMonitor.append(["content": "хорошая"], to: url)
+        try JSONLWriter.appendNow(["content": "хорошая"], to: url)
 
-        XCTAssertThrowsError(try ClipboardMonitor.append(["content": Date()], to: url))
+        XCTAssertThrowsError(try JSONLWriter.appendNow(["content": Date()], to: url))
 
         let lines = try String(contentsOf: url, encoding: .utf8)
             .components(separatedBy: "\n").filter { !$0.isEmpty }

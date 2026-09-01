@@ -42,9 +42,11 @@ final class EchoCancellerTests: XCTestCase {
         XCTAssertTrue(why?.contains("search window") ?? false, why ?? "nil")
     }
 
-    /// A result good enough to use needs no explaining.
-    func testAGoodResultHasNoDiagnosis() {
-        XCTAssertNil(EchoCanceller.diagnosis(for: metrics(erle: 9.26, delayMs: 268, confidence: 0.31)))
+    /// With no far-end audio there is no ERLE and nothing to explain. Note the
+    /// function does NOT re-check the acceptance threshold: only the verdict
+    /// decides that, and the one caller asks after it has already rejected.
+    func testNoErleMeansNothingToExplain() {
+        XCTAssertNil(EchoCanceller.diagnosis(for: metrics(erle: nil, delayMs: 268, confidence: 0.31)))
     }
 
     // MARK: - verdict

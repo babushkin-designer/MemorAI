@@ -121,8 +121,11 @@ class EchoCanceller {
     /// call has run 1422 ms out — or it found it and the echo still would not
     /// cancel, which is what recording through open speakers does to a linear
     /// canceller. Nil when the result was good enough to use.
+    /// Only called for a result `verdict` already rejected — it does not
+    /// re-derive that rule, which picks between two ERLE thresholds and would
+    /// be a second copy to keep in step.
     static func diagnosis(for m: Metrics) -> String? {
-        guard let erle = m.erleDb, erle < minERLEWithoutVoiceEvidence else { return nil }
+        guard m.erleDb != nil else { return nil }
         if m.delayConfidence < weakDelayConfidence || abs(m.delayMs) >= delaySearchWindowMs - 50 {
             return String(format: "lag %+.0f ms at confidence %.3f — that is the edge of the ±1 s search window, so measure the true offset before trusting this number",
                           m.delayMs, m.delayConfidence)

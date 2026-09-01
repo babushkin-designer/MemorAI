@@ -20,11 +20,15 @@ class OCRProcessor {
         "/usr/local/bin/python3",     // Intel Homebrew
     ]
 
-    private var sidecar: Process?
-    /// The same process, reachable without the queue. `queue` can be sitting
-    /// inside a 30 s read, and quit may not wait that long for it.
+    /// Guarded by `shutdownLock` rather than by `queue`, because `queue` can be
+    /// sitting inside a 30 s read and quit may not wait that long for it. An
+    /// uncontended lock costs nothing next to what it guards against.
     private let shutdownLock = NSLock()
-    private var liveSidecar: Process?
+    private var sidecar: Process? {
+        get { shutdownLock.withLock { _sidecar } }
+        set { shutdownLock.withLock { _sidecar = newValue } }
+    }
+    private var _sidecar: Process?
     private var sidecarIn: FileHandle?
     private var sidecarOut: FileHandle?
     private var outBuffer = Data()
@@ -124,7 +128,6 @@ class OCRProcessor {
         }
 
         sidecar = proc
-        shutdownLock.lock(); liveSidecar = proc; shutdownLock.unlock()
         sidecarIn = stdin
         sidecarOut = stdout
         consecutiveFailures = 0
@@ -154,17 +157,16 @@ class OCRProcessor {
     /// the process out from under that read just ends it early, which is what
     /// we want anyway.
     func shutdown() {
-        shutdownLock.lock()
-        let proc = liveSidecar
-        liveSidecar = nil
-        shutdownLock.unlock()
+        let proc = shutdownLock.withLock { () -> Process? in
+            let running = _sidecar
+            _sidecar = nil
+            return running
+        }
         proc?.terminate()
     }
 
     private func teardownSidecar() {
-        sidecar?.terminate()
-        sidecar = nil
-        shutdownLock.lock(); liveSidecar = nil; shutdownLock.unlock()
+        shutdown()
         sidecarIn = nil
         sidecarOut = nil
         outBuffer.removeAll()
