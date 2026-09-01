@@ -679,9 +679,15 @@ class Transcriber {
     }
 
     /// Get media file duration in seconds via ffmpeg. Returns 0 on failure or missing file.
+    ///
+    /// No output file: ffmpeg prints the container's duration and exits without
+    /// decoding anything. It used to decode the whole track to `-f null -`,
+    /// which on a four-hour call meant burning the full 10 s timeout — twice
+    /// per transcription — and then parsing the very same header line it had
+    /// printed in the first second.
     private func trackDuration(_ url: URL?) -> Double {
         guard let url = url, FileManager.default.fileExists(atPath: url.path) else { return 0 }
-        let result = runProcess(ffmpegPath, args: ["-hide_banner", "-nostats", "-i", url.path, "-f", "null", "-"], timeout: 10)
+        let result = runProcess(ffmpegPath, args: ["-hide_banner", "-nostats", "-i", url.path], timeout: 10)
         let output = result.stderr
         if let match = try? NSRegularExpression(pattern: #"Duration: (\d+):(\d+):(\d+\.\d+)"#)
                 .firstMatch(in: output, range: NSRange(output.startIndex..., in: output)) {
