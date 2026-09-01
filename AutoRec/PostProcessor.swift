@@ -39,11 +39,6 @@ final class PostProcessor {
 
     private var isRecordingActive: Bool { gateLock.withLock { _recordingActive } }
 
-    /// Asked by the long stages between their own units of work. Terminating
-    /// the child in flight only frees the machine until the stage starts the
-    /// next one, and a transcription is dozens of whisper runs long.
-    private var pauseCheck: () -> Bool { { [weak self] in self?.isRecordingActive ?? false } }
-
     /// Open or close the gate. While it is closed nothing heavy runs: the
     /// pipeline stops between stages, and the child process in flight is
     /// terminated.
@@ -61,9 +56,13 @@ final class PostProcessor {
         guard changed else { return }
 
         if active {
-            ProcessRunner.cancelPostProcessing(reason: "recording started")
+            // Suspend, not just cancel: the runner then refuses to start the
+            // next chunk too, so a stage in the middle of dozens of whisper
+            // runs stops at the first one instead of at the last.
+            ProcessRunner.suspendPostProcessing(reason: "recording started")
             log("[PostProcessor] Gate closed — no post-processing while recording")
         } else {
+            ProcessRunner.resumePostProcessing()
             log("[PostProcessor] Gate open — resuming any deferred session")
             // A moment of quiet after a call: the recorders have just finalized
             // their files, and starting whisper in the same breath would put
@@ -324,8 +323,7 @@ final class PostProcessor {
                                              namingURL: manifest.resolve(manifest.micFile, in: dir),
                                              micStartSeconds: manifest.micStartSeconds,
                                              systemStartSeconds: manifest.systemStartSeconds,
-                                             videoStartSeconds: manifest.videoStartSeconds,
-                                             shouldPause: pauseCheck) { finished in
+                                             videoStartSeconds: manifest.videoStartSeconds) { finished in
             settled = finished
             done.signal()
         }

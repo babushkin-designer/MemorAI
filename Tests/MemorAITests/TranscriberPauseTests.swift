@@ -42,6 +42,10 @@ final class TranscriberPauseTests: XCTestCase {
     /// The whole point of the pause: no transcript file, and the caller is told
     /// the run is not settled. A half-written transcript would be worse than
     /// none — its mere existence makes every later attempt skip the session.
+    ///
+    /// Driven through the real mechanism — a suspended `ProcessRunner`, which
+    /// is what a live recording does — rather than a stub, so this covers the
+    /// wiring and not just the branch.
     func testPausedRunWritesNoTranscriptAndReportsUnsettled() throws {
         try requireTools()
         let dir = try makeDir()
@@ -52,10 +56,12 @@ final class TranscriberPauseTests: XCTestCase {
         makeTone(mic, seconds: 3, frequency: 440)
         makeTone(sys, seconds: 3, frequency: 880)
 
+        ProcessRunner.suspendPostProcessing(reason: "test")
+        defer { ProcessRunner.resumePostProcessing() }
+
         let done = expectation(description: "transcription returns")
         var settled = true
-        Transcriber.shared.transcribeSession(micURL: mic, systemURL: sys,
-                                             shouldPause: { true }) { finished in
+        Transcriber.shared.transcribeSession(micURL: mic, systemURL: sys) { finished in
             settled = finished
             done.fulfill()
         }

@@ -50,6 +50,12 @@ enum ProcessRunner {
 
     private static let registryLock = NSLock()
     private static var registry: [ObjectIdentifier: Entry] = [:]
+    /// While true no `.postProcessing` child is allowed to start. Killing the
+    /// ones already running only frees the machine until the next one launches,
+    /// and a transcription is dozens of whisper runs long — the caller would
+    /// have to remember to ask before each. The runner refuses instead, which
+    /// covers every stage, including ones written later.
+    private static var suspended = false
     /// Set when a cancellation actually hit something, cleared by the pipeline
     /// when it reads it. Without this a cancelled stage looks exactly like a
     /// stage that failed on its own, and gets recorded as done.
@@ -59,6 +65,21 @@ enum ProcessRunner {
     /// starts: whisper on the GPU and two ffmpegs are precisely the load that
     /// makes the speakers crackle during a call, and the pipeline is resumable
     /// by design, so stopping it costs only the stage in flight.
+    /// Stop the heavy work and keep it stopped: running children are killed and
+    /// new ones are refused until `resumePostProcessing`.
+    static func suspendPostProcessing(reason: String) {
+        registryLock.lock()
+        suspended = true
+        registryLock.unlock()
+        cancelPostProcessing(reason: reason)
+    }
+
+    static func resumePostProcessing() {
+        registryLock.lock()
+        suspended = false
+        registryLock.unlock()
+    }
+
     static func cancelPostProcessing(reason: String) {
         registryLock.lock()
         let entries = Array(registry.values)
@@ -90,6 +111,19 @@ enum ProcessRunner {
     @discardableResult
     static func run(_ path: String, args: [String], timeout: TimeInterval = 300,
                     role: Role = .foreground) -> Result {
+        if role == .postProcessing {
+            registryLock.lock()
+            let refuse = suspended
+            if refuse { sawCancellation = true }
+            registryLock.unlock()
+            if refuse {
+                // Reported as a cancellation, not a failure: the caller must
+                // leave its stage open and come back to it.
+                return Result(exitCode: Result.cancelledCode, stdout: "",
+                              stderr: "not started: post-processing is suspended")
+            }
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = args
