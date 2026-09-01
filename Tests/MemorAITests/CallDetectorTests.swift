@@ -32,4 +32,43 @@ final class CallDetectorTests: XCTestCase {
         XCTAssertFalse(CallDetector.shouldStayInCall(
             recordingMode: false, systemAudioAvailable: true, systemAudioSilent: false))
     }
+
+    // MARK: - Splitting back-to-back calls
+
+    /// The far side talking through the call app is what a mute sounds like:
+    /// keep recording however long it lasts.
+    func testMuteWithTheFarSideTalkingIsNeverSplit() {
+        XCTAssertTrue(CallDetector.shouldStayInCall(
+            recordingMode: true, systemAudioAvailable: true, systemAudioSilent: false,
+            callAppQuietFor: nil, splitAfter: 180))
+    }
+
+    /// A short silence from the far side is a pause in the meeting, not its end.
+    func testABriefQuietSpellIsNotASplit() {
+        XCTAssertTrue(CallDetector.shouldStayInCall(
+            recordingMode: true, systemAudioAvailable: true, systemAudioSilent: false,
+            callAppQuietFor: 179, splitAfter: 180))
+    }
+
+    /// Music after the meeting: the Mac is not silent, so the old rule kept
+    /// recording — for four hours, on 2026-09-01. The call app has said nothing
+    /// for three minutes, so the meeting is over.
+    func testMusicAfterTheMeetingEndsTheRecording() {
+        XCTAssertFalse(CallDetector.shouldStayInCall(
+            recordingMode: true, systemAudioAvailable: true, systemAudioSilent: false,
+            callAppQuietFor: 180, splitAfter: 180))
+    }
+
+    /// The split is scoped to a live recording — nothing to divide otherwise.
+    func testQuietCallAppOutsideRecordingChangesNothing() {
+        XCTAssertFalse(CallDetector.shouldStayInCall(
+            recordingMode: false, systemAudioAvailable: true, systemAudioSilent: false,
+            callAppQuietFor: 600, splitAfter: 180))
+    }
+
+    /// Callers that do not measure the call app's output get the old behaviour.
+    func testWithoutTheNewSignalTheOldRuleStands() {
+        XCTAssertTrue(CallDetector.shouldStayInCall(
+            recordingMode: true, systemAudioAvailable: true, systemAudioSilent: false))
+    }
 }

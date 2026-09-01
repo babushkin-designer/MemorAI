@@ -14,6 +14,14 @@ import Darwin
 /// threshold indefinitely. One exception (see shouldStayInCall): while recording, a free
 /// mic with ACTIVE system audio means the user muted themselves in the call app (Electron
 /// apps release the mic on mute) — the call ends only once system audio goes silent too.
+///
+/// That exception is also what welds back-to-back meetings into one file: between two
+/// calls the mic is free but the Mac is rarely silent, so the session runs on. Measured
+/// 2026-09-01: one recording covered 07:12–11:38 UTC across five mic releases, ending only
+/// when the speakers finally went quiet for 90 s — 4.4 hours and four meetings in a single
+/// transcript. So the exception is now scoped to the app that was holding the mic: the far
+/// side of YOUR call playing through Pachca keeps the recording, Spotify after it does
+/// not. Same per-process API, `kAudioProcessPropertyIsRunningOutput`.
 class CallDetector {
     var onCallStarted: (() -> Void)?
     var onCallEnded: (() -> Void)?
@@ -29,6 +37,25 @@ class CallDetector {
 
     private var recordingMode = false
     private var recordingStartTime: Date?
+
+    /// Mic free and the app that was holding it silent for this long ends the
+    /// recording, so the next call gets its own file. A starting point, not a
+    /// measurement: the gap between two meetings is minutes, while a mute long
+    /// enough to matter has the far side talking through it. Every release and
+    /// re-acquisition is logged with its duration, so this can be tuned against
+    /// real calls rather than argued about.
+    ///
+    /// The failure it can produce is a meeting split in two when nobody speaks
+    /// for three minutes while the user is muted — two whole files, and
+    /// recording resumes the moment the user unmutes.
+    static let splitAfterCallAppQuiet: TimeInterval = 180
+
+    /// PIDs seen holding the mic during this recording. "Is the call still on"
+    /// is asked of these and nothing else.
+    private var callAppPIDs: Set<pid_t> = []
+    /// When the mic went free, and when the call apps last stopped playing.
+    private var micFreeSince: Date?
+    private var callAppQuietSince: Date?
 
     // Retained informational state (from RecordingManager callbacks). Not used for call-end.
     private(set) var systemAudioSilent = false
@@ -58,6 +85,9 @@ class CallDetector {
         systemAudioSilent = false
         micSilent = false
         systemAudioAvailable = true
+        callAppPIDs = []
+        micFreeSince = nil
+        callAppQuietSince = nil
         log("[CallDetector] Entered recording mode")
     }
 
@@ -67,6 +97,9 @@ class CallDetector {
         systemAudioSilent = false
         micSilent = false
         systemAudioAvailable = true
+        callAppPIDs = []
+        micFreeSince = nil
+        callAppQuietSince = nil
         activeCount = 0
         inactiveCount = 0
         callActive = false
@@ -109,6 +142,17 @@ class CallDetector {
             activeCount = 0
         }
 
+        if recordingMode && inCall {
+            callAppPIDs.formUnion(foreign.map { $0.pid })
+            if let since = micFreeSince {
+                // The instrument for the threshold above: how long the mic
+                // actually sits free inside one meeting, versus between two.
+                log("[CallDetector] Mic re-acquired after \(Int(Date().timeIntervalSince(since)))s free")
+                micFreeSince = nil
+                callAppQuietSince = nil
+            }
+        }
+
         if !callActive && activeCount >= debounceCount {
             callActive = true
             if !recordingMode {
@@ -126,24 +170,65 @@ class CallDetector {
             // recording, treat "mic free but system audio active" as still
             // in-call; the call only ends once system audio has also been
             // silent for its threshold (or was never available).
+            let now = Date()
+            if recordingMode {
+                if micFreeSince == nil { micFreeSince = now }
+                if callAppsPlaying() {
+                    callAppQuietSince = nil
+                } else if callAppQuietSince == nil {
+                    callAppQuietSince = now
+                }
+            }
+            let quietFor = callAppQuietSince.map { now.timeIntervalSince($0) }
+
             if Self.shouldStayInCall(recordingMode: recordingMode,
                                      systemAudioAvailable: systemAudioAvailable,
-                                     systemAudioSilent: systemAudioSilent) {
+                                     systemAudioSilent: systemAudioSilent,
+                                     callAppQuietFor: quietFor,
+                                     splitAfter: Self.splitAfterCallAppQuiet) {
                 if inactiveCount == debounceCount {
-                    log("[CallDetector] Mic released but system audio still active (muted in call app?) — keeping recording")
+                    let who = callAppQuietSince == nil ? "call app still playing" : "call app quiet"
+                    log("[CallDetector] Mic released, \(who) — keeping recording")
                 }
                 return
             }
             callActive = false
-            log("[CallDetector] \(recordingMode ? "No other process holds mic" : "Mic released") — call ended")
+            if recordingMode, let quietFor = quietFor, quietFor >= Self.splitAfterCallAppQuiet {
+                log("[CallDetector] Mic free and the call app silent for \(Int(quietFor))s — ending here so the next call gets its own file")
+            } else {
+                log("[CallDetector] \(recordingMode ? "No other process holds mic" : "Mic released") — call ended")
+            }
             onCallEnded?()
         }
     }
 
     /// Pure decision: mic is free, should we still consider the call active?
+    ///
+    /// Two ways to answer no. The Mac has gone quiet, so there is no call left
+    /// to record — or something IS playing, but not the app that was holding
+    /// the mic, and has not been for `splitAfter`. The second is music after a
+    /// meeting rather than the far side of one.
     static func shouldStayInCall(recordingMode: Bool, systemAudioAvailable: Bool,
-                                 systemAudioSilent: Bool) -> Bool {
-        recordingMode && systemAudioAvailable && !systemAudioSilent
+                                 systemAudioSilent: Bool,
+                                 callAppQuietFor: TimeInterval? = nil,
+                                 splitAfter: TimeInterval = .infinity) -> Bool {
+        guard recordingMode, systemAudioAvailable, !systemAudioSilent else { return false }
+        if let quiet = callAppQuietFor, quiet >= splitAfter { return false }
+        return true
+    }
+
+    /// Is any app that held the mic during this recording playing audio? While
+    /// the user is muted this is the far side talking, and the only thing that
+    /// separates "still in the meeting" from "the meeting ended and iTunes
+    /// picked up where it left off".
+    private func callAppsPlaying() -> Bool {
+        guard !callAppPIDs.isEmpty else { return false }
+        for object in audioProcessObjects() {
+            let pid = processPID(object)
+            guard callAppPIDs.contains(pid) else { continue }
+            if processIsRunningOutput(object) { return true }
+        }
+        return false
     }
 
     // MARK: - Per-process CoreAudio query
@@ -159,8 +244,8 @@ class CallDetector {
         }
     }
 
-    /// Enumerates audio process objects and returns ones (other than us) capturing mic input.
-    private func foreignMicHolders() -> [ForeignMicHolder] {
+    /// Every process CoreAudio knows about, ours included. Callers filter.
+    private func audioProcessObjects() -> [AudioObjectID] {
         var listAddress = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyProcessObjectList,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -180,9 +265,13 @@ class CallDetector {
         ) == noErr else {
             return []
         }
+        return objects
+    }
 
+    /// Enumerates audio process objects and returns ones (other than us) capturing mic input.
+    private func foreignMicHolders() -> [ForeignMicHolder] {
         var holders: [ForeignMicHolder] = []
-        for obj in objects {
+        for obj in audioProcessObjects() {
             guard processIsRunningInput(obj) else { continue }
             let pid = processPID(obj)
             guard pid > 0, pid != ourPID else { continue }
@@ -236,9 +325,17 @@ class CallDetector {
         return String(cString: buffer)
     }
 
+    private func processIsRunningOutput(_ object: AudioObjectID) -> Bool {
+        processFlag(object, kAudioProcessPropertyIsRunningOutput)
+    }
+
     private func processIsRunningInput(_ object: AudioObjectID) -> Bool {
+        processFlag(object, kAudioProcessPropertyIsRunningInput)
+    }
+
+    private func processFlag(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> Bool {
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioProcessPropertyIsRunningInput,
+            mSelector: selector,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
