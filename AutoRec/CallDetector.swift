@@ -50,9 +50,15 @@ class CallDetector {
     /// recording resumes the moment the user unmutes.
     static let splitAfterCallAppQuiet: TimeInterval = 180
 
-    /// PIDs seen holding the mic during this recording. "Is the call still on"
-    /// is asked of these and nothing else.
-    private var callAppPIDs: Set<pid_t> = []
+    /// App bundles seen holding the mic during this recording. "Is the call
+    /// still on" is asked of these and nothing else.
+    ///
+    /// Bundles, not PIDs: Electron splits itself across helpers, and they are
+    /// not the same one. Pachca captures the mic from
+    /// `Pachca.app/…/Frameworks/Pachca Helper.app/…/Pachca Helper` while
+    /// playback comes out of a sibling helper process — matching the recorded
+    /// PID would never see the far side and would cut every mute in half.
+    private var callAppBundles: Set<String> = []
     /// When the mic went free, and when the call apps last stopped playing.
     private var micFreeSince: Date?
     private var callAppQuietSince: Date?
@@ -85,7 +91,7 @@ class CallDetector {
         systemAudioSilent = false
         micSilent = false
         systemAudioAvailable = true
-        callAppPIDs = []
+        callAppBundles = []
         micFreeSince = nil
         callAppQuietSince = nil
         log("[CallDetector] Entered recording mode")
@@ -97,7 +103,7 @@ class CallDetector {
         systemAudioSilent = false
         micSilent = false
         systemAudioAvailable = true
-        callAppPIDs = []
+        callAppBundles = []
         micFreeSince = nil
         callAppQuietSince = nil
         activeCount = 0
@@ -143,7 +149,9 @@ class CallDetector {
         }
 
         if recordingMode && inCall {
-            callAppPIDs.formUnion(foreign.map { $0.pid })
+            callAppBundles.formUnion(foreign.compactMap { holder in
+                executablePath(pid: holder.pid).map { Self.appBundleKey(for: $0) }
+            })
             if let since = micFreeSince {
                 // The instrument for the threshold above: how long the mic
                 // actually sits free inside one meeting, versus between two.
@@ -222,13 +230,23 @@ class CallDetector {
     /// separates "still in the meeting" from "the meeting ended and iTunes
     /// picked up where it left off".
     private func callAppsPlaying() -> Bool {
-        guard !callAppPIDs.isEmpty else { return false }
+        guard !callAppBundles.isEmpty else { return false }
         for object in audioProcessObjects() {
+            guard processIsRunningOutput(object) else { continue }
             let pid = processPID(object)
-            guard callAppPIDs.contains(pid) else { continue }
-            if processIsRunningOutput(object) { return true }
+            guard pid > 0, pid != ourPID,
+                  let path = executablePath(pid: pid) else { continue }
+            if callAppBundles.contains(Self.appBundleKey(for: path)) { return true }
         }
         return false
+    }
+
+    /// The outermost `.app` an executable lives in, which is what makes a pile
+    /// of Electron helpers one application. Binaries outside a bundle
+    /// (`/usr/libexec/avconferenced`) are their own key.
+    static func appBundleKey(for executablePath: String) -> String {
+        guard let range = executablePath.range(of: ".app/") else { return executablePath }
+        return String(executablePath[..<range.lowerBound]) + ".app"
     }
 
     // MARK: - Per-process CoreAudio query

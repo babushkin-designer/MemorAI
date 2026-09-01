@@ -71,4 +71,28 @@ final class CallDetectorTests: XCTestCase {
         XCTAssertTrue(CallDetector.shouldStayInCall(
             recordingMode: true, systemAudioAvailable: true, systemAudioSilent: false))
     }
+
+    /// Electron holds the mic in one helper and plays audio out of another.
+    /// Both must resolve to the one app, or the far side is invisible and every
+    /// mute gets cut in half. Real paths from this machine, 2026-09-01.
+    func testElectronHelpersResolveToOneApp() {
+        let mic = CallDetector.appBundleKey(
+            for: "/Applications/Pachca.app/Contents/Frameworks/Pachca Helper.app/Contents/MacOS/Pachca Helper")
+        let speaker = CallDetector.appBundleKey(
+            for: "/Applications/Pachca.app/Contents/Frameworks/Pachca Helper (Plugin).app/Contents/MacOS/Pachca Helper (Plugin)")
+        XCTAssertEqual(mic, "/Applications/Pachca.app")
+        XCTAssertEqual(mic, speaker)
+    }
+
+    func testUnrelatedAppsStayApart() {
+        XCTAssertNotEqual(
+            CallDetector.appBundleKey(for: "/Applications/Pachca.app/Contents/MacOS/Pachca"),
+            CallDetector.appBundleKey(for: "/Applications/Spotify.app/Contents/MacOS/Spotify"))
+    }
+
+    /// FaceTime routes audio through a daemon that lives in no bundle at all.
+    func testBinariesOutsideABundleAreTheirOwnKey() {
+        XCTAssertEqual(CallDetector.appBundleKey(for: "/usr/libexec/avconferenced"),
+                       "/usr/libexec/avconferenced")
+    }
 }
