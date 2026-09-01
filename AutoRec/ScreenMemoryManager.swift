@@ -80,6 +80,7 @@ class ScreenMemoryManager {
         clipboardSource = nil
         stopKeyboardMonitoring()
         stopScreenStateMonitoring()
+        ocrProcessor.shutdown()
     }
 
     // MARK: - Screen Lock / Sleep
@@ -189,9 +190,15 @@ class ScreenMemoryManager {
 
     private func startClipboardPolling() {
         // Use a GCD timer on the main queue — NSPasteboard.changeCount
-        // only updates reliably on the main thread
+        // only updates reliably on the main thread.
+        //
+        // Twice a second, not once every two: two copies inside one interval
+        // are indistinguishable from one, since all the pasteboard offers is
+        // "the contents changed" plus whatever is there now. Reading the change
+        // count is a cheap IPC call and the contents are only read when it
+        // moves, so the shorter interval costs close to nothing.
         let source = DispatchSource.makeTimerSource(queue: .main)
-        source.schedule(deadline: .now() + 2, repeating: 2)
+        source.schedule(deadline: .now() + 0.5, repeating: 0.5)
         source.setEventHandler { [weak self] in
             guard let self = self, self.isRunning, SettingsManager.shared.saveClipboard else { return }
             self.clipboard.checkAndSave(excludedBundleIds: SettingsManager.shared.excludedBundleIds)

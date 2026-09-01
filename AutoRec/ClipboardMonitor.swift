@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ObjCTry
 
 struct ClipboardEntry {
     let timestamp: Date
@@ -10,7 +11,13 @@ struct ClipboardEntry {
 }
 
 class ClipboardMonitor {
+    /// Only ever advanced once the entry it stands for is on disk — or once we
+    /// have decided on purpose not to keep it. Advancing it first, as this used
+    /// to, turned a failed append into a copy that never existed.
     private var lastChangeCount: Int = 0
+    /// The change count whose append last failed, so a disk that stays full
+    /// does not write the same complaint into the log every poll.
+    private var lastReportedFailure: Int = 0
     private var storageURL: URL?
     private let pasteboard = NSPasteboard.general
 
@@ -29,7 +36,6 @@ class ClipboardMonitor {
         guard let storage = storageURL else { return }
         let current = pasteboard.changeCount
         guard current != lastChangeCount else { return }
-        lastChangeCount = current
 
         // Honor the de-facto standard privacy markers set by password managers
         // and clipboard tools: never persist concealed or transient contents.
@@ -40,6 +46,7 @@ class ClipboardMonitor {
         ]
         if let types = pasteboard.types, privacyMarkers.contains(where: types.contains) {
             log("[Clipboard] Skipped concealed/transient clipboard entry")
+            lastChangeCount = current
             return
         }
 
@@ -47,6 +54,7 @@ class ClipboardMonitor {
         let frontApp = NSWorkspace.shared.frontmostApplication
         if let bundleId = frontApp?.bundleIdentifier,
            excludedBundleIds.contains(bundleId) {
+            lastChangeCount = current
             return
         }
 
@@ -98,30 +106,56 @@ class ClipboardMonitor {
         entry["type"] = type
         entry["content"] = content
 
-        // Add to in-memory buffer
+        // Disk first. The in-memory buffer and the change count both stand for
+        // "this copy is kept", and neither may say so before it is true.
+        let logURL = storage.appendingPathComponent("clipboard.jsonl")
+        do {
+            try Self.append(entry, to: logURL)
+        } catch {
+            if lastReportedFailure != current {
+                lastReportedFailure = current
+                log("[Clipboard] ❌ Could not append to clipboard.jsonl: \(error.localizedDescription) — retrying")
+            }
+            return   // change count untouched: the next poll tries this copy again
+        }
+        lastChangeCount = current
+
         let clipEntry = ClipboardEntry(timestamp: now, appName: appName, bundleId: bundleId, type: type, content: content)
         recentEntries.insert(clipEntry, at: 0)
         if recentEntries.count > maxEntries {
             recentEntries.removeLast()
         }
+    }
 
-        // Append to clipboard.jsonl
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]),
-              var line = String(data: jsonData, encoding: .utf8) else { return }
-        line += "\n"
-
-        let logURL = storage.appendingPathComponent("clipboard.jsonl")
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: logURL.path) {
-                if let fh = try? FileHandle(forWritingTo: logURL) {
-                    fh.seekToEndOfFile()
-                    fh.write(data)
-                    fh.closeFile()
-                }
-            } else {
-                try? data.write(to: logURL)
-            }
+    /// Append one JSON record as a line. Throws so the caller can keep the
+    /// entry pending instead of losing it.
+    static func append(_ entry: [String: Any], to logURL: URL) throws {
+        // JSONSerialization RAISES on a value it cannot encode instead of
+        // throwing, and an ObjC exception unwinding into Swift aborts the
+        // process. Everything put in here is a String today; a crash is still
+        // not the right answer if that ever stops being true.
+        var encoded: Data?
+        var swiftError: Error?
+        var raised: NSError?
+        let completed = MEMRunCatchingExceptions({
+            do { encoded = try JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) }
+            catch { swiftError = error }
+        }, &raised)
+        if let swiftError = swiftError { throw swiftError }
+        if !completed, let raised = raised { throw raised }
+        guard var data = encoded else {
+            throw NSError(domain: "MemorAI.Clipboard", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "entry could not be encoded"])
         }
+        data.append(0x0A)
+        guard FileManager.default.fileExists(atPath: logURL.path) else {
+            try data.write(to: logURL)
+            return
+        }
+        let handle = try FileHandle(forWritingTo: logURL)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
     }
 
     /// Load recent entries from clipboard.jsonl
