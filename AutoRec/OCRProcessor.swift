@@ -21,6 +21,10 @@ class OCRProcessor {
     ]
 
     private var sidecar: Process?
+    /// The same process, reachable without the queue. `queue` can be sitting
+    /// inside a 30 s read, and quit may not wait that long for it.
+    private let shutdownLock = NSLock()
+    private var liveSidecar: Process?
     private var sidecarIn: FileHandle?
     private var sidecarOut: FileHandle?
     private var outBuffer = Data()
@@ -120,6 +124,7 @@ class OCRProcessor {
         }
 
         sidecar = proc
+        shutdownLock.lock(); liveSidecar = proc; shutdownLock.unlock()
         sidecarIn = stdin
         sidecarOut = stdout
         consecutiveFailures = 0
@@ -142,15 +147,24 @@ class OCRProcessor {
 
     /// Stop the resident sidecar. Nothing did this on quit, so the Python
     /// process outlived the app that spawned it and kept a core busy (seen
-    /// 2026-09-01, alongside an orphaned AEC sidecar). Synchronous on purpose:
-    /// on the way out there is no later.
+    /// 2026-09-01, alongside an orphaned AEC sidecar).
+    ///
+    /// Deliberately does NOT go through `queue`: a request in flight holds it
+    /// for up to 30 s, and quit is not allowed to wait that long. Terminating
+    /// the process out from under that read just ends it early, which is what
+    /// we want anyway.
     func shutdown() {
-        queue.sync { self.teardownSidecar() }
+        shutdownLock.lock()
+        let proc = liveSidecar
+        liveSidecar = nil
+        shutdownLock.unlock()
+        proc?.terminate()
     }
 
     private func teardownSidecar() {
         sidecar?.terminate()
         sidecar = nil
+        shutdownLock.lock(); liveSidecar = nil; shutdownLock.unlock()
         sidecarIn = nil
         sidecarOut = nil
         outBuffer.removeAll()
