@@ -250,6 +250,42 @@ final class PostProcessorTests: XCTestCase {
         wait(for: [resumed], timeout: 60)
     }
 
+    /// "Transcribe Now" on a call whose manifest is long gone: the stand-in
+    /// must not send an hour-old recording back through echo cancellation and
+    /// muxing to produce files that are already sitting next to it.
+    func testAStandInManifestOnlyAsksForTheTranscript() {
+        let m = CallSessionManifest.forRetranscribing(
+            tag: "2026-01-01_00-00-00",
+            mic: URL(fileURLWithPath: "/tmp/call_2026-01-01_00-00-00_mic.m4a"),
+            system: URL(fileURLWithPath: "/tmp/call_2026-01-01_00-00-00_system.m4a"),
+            screen: nil)
+
+        XCTAssertTrue(m.stages.micPublished)
+        XCTAssertTrue(m.stages.echoCancelled)
+        XCTAssertTrue(m.stages.muxed)
+        XCTAssertFalse(m.stages.transcribed)
+        XCTAssertFalse(m.stages.allDone)
+        XCTAssertTrue(m.recordingFinished, "the recorders finished long ago")
+        XCTAssertEqual(m.micFile, "call_2026-01-01_00-00-00_mic.m4a")
+        XCTAssertNil(m.screenFile)
+    }
+
+    /// It round-trips like any other, so a request made during a call survives
+    /// on disk until the gate opens.
+    func testAStandInManifestSurvivesOnDisk() throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let m = CallSessionManifest.forRetranscribing(
+            tag: "2026-01-01_00-00-00", mic: nil,
+            system: URL(fileURLWithPath: "/tmp/call_2026-01-01_00-00-00_system.m4a"), screen: nil)
+        m.save(in: dir)
+
+        let loaded = try XCTUnwrap(CallSessionManifest.load(m.url(in: dir)))
+        XCTAssertEqual(loaded.stages.transcribed, false)
+        XCTAssertEqual(loaded.stages.muxed, true)
+        XCTAssertEqual(loaded.systemFile, "call_2026-01-01_00-00-00_system.m4a")
+    }
+
     // MARK: - helpers
 
     private func makeDir() throws -> URL {

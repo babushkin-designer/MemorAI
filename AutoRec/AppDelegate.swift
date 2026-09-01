@@ -444,8 +444,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if let url = session.transcriptURL {
                 addOpenItem(sub, "📝 Transcript", url)
+            } else if session.hasAudio {
+                // A call can sit without a transcript for reasons the app
+                // cannot fix by itself — whisper was missing, the model was
+                // not installed, the session ran out of automatic attempts.
+                // Asking again should not require going through the files.
+                let retry = NSMenuItem(title: "📝 Transcribe Now",
+                                       action: #selector(transcribeCall(_:)), keyEquivalent: "")
+                retry.target = self
+                retry.representedObject = session.tag
+                sub.addItem(retry)
             } else {
-                let pending = NSMenuItem(title: "📝 Transcript (pending…)", action: nil, keyEquivalent: "")
+                let pending = NSMenuItem(title: "📝 Transcript (no audio)", action: nil, keyEquivalent: "")
                 pending.isEnabled = false
                 sub.addItem(pending)
             }
@@ -513,6 +523,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openFileURL(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    /// Put a call back through transcription. Its own manifest is preferred
+    /// when it still exists — it carries the host-clock starts that put both
+    /// speakers on one timeline — and a stand-in is built from the files on
+    /// disk when it does not. Either way the recording gate still applies: a
+    /// request made during a call waits for the call to end.
+    @objc private func transcribeCall(_ sender: NSMenuItem) {
+        guard let tag = sender.representedObject as? String,
+              let session = sessionForTag(tag) else { return }
+        let dir = URL(fileURLWithPath: settings.outputPath)
+
+        var manifest: CallSessionManifest
+        if let existing = CallSessionManifest.load(CallSessionManifest.url(forTag: tag, in: dir)) {
+            manifest = existing
+            manifest.attempts = 0
+        } else {
+            manifest = .forRetranscribing(tag: tag, mic: session.micURL,
+                                          system: session.systemURL, screen: session.videoURL)
+        }
+        manifest.stages.transcribed = false
+        log("[Menu] Transcription requested for \(tag)")
+        PostProcessor.shared.enqueue(manifest, in: dir)
     }
 
     /// The plain POSIX path, which is what gets pasted into a chat. Writing a
