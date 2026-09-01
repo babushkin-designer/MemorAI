@@ -39,6 +39,11 @@ final class PostProcessor {
 
     private var isRecordingActive: Bool { gateLock.withLock { _recordingActive } }
 
+    /// Asked by the long stages between their own units of work. Terminating
+    /// the child in flight only frees the machine until the stage starts the
+    /// next one, and a transcription is dozens of whisper runs long.
+    private var pauseCheck: () -> Bool { { [weak self] in self?.isRecordingActive ?? false } }
+
     /// Open or close the gate. While it is closed nothing heavy runs: the
     /// pipeline stops between stages, and the child process in flight is
     /// terminated.
@@ -185,6 +190,7 @@ final class PostProcessor {
             log("[PostProcessor] Session \(manifest.tag) complete")
         } else if attempt >= CallSessionManifest.maxAttempts {
             manifest.remove(in: dir)
+            Transcriber.discardPartials(tag: manifest.tag, in: dir)
             log("[PostProcessor] ⚠️ Session \(manifest.tag) still unfinished after \(attempt) attempts — giving up (stages: \(manifest.stages))")
         } else {
             manifest.save(in: dir)
@@ -308,6 +314,7 @@ final class PostProcessor {
         setTranscribing(true)
         log("[PostProcessor] Starting transcription for \(manifest.tag)…")
         let done = DispatchSemaphore(value: 0)
+        var settled = false
         // Transcribe the cleaned mic but keep naming the session after the
         // canonical file, or the transcript lands next to it under a mangled
         // name. Offsets put both tracks on one timeline so the speaker-labeled
@@ -317,11 +324,20 @@ final class PostProcessor {
                                              namingURL: manifest.resolve(manifest.micFile, in: dir),
                                              micStartSeconds: manifest.micStartSeconds,
                                              systemStartSeconds: manifest.systemStartSeconds,
-                                             videoStartSeconds: manifest.videoStartSeconds) {
+                                             videoStartSeconds: manifest.videoStartSeconds,
+                                             shouldPause: pauseCheck) { finished in
+            settled = finished
             done.signal()
         }
         done.wait()
         setTranscribing(false)
+        // Paused for a recording: the finished chunks are on disk and the stage
+        // stays open. Recording it as done here would leave the call with the
+        // half of the transcript that happened to be ready.
+        guard settled else {
+            log("[PostProcessor] Transcription for \(manifest.tag) paused — resumes after the recording")
+            return
+        }
         manifest.stages.transcribed = true
         manifest.save(in: dir)
         log("[PostProcessor] Transcription complete for \(manifest.tag)")

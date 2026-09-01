@@ -8,7 +8,7 @@ personal fork; do not push to any remote.
 ## Build / verify
 
 - `swift build` — the primary gate (repo root). ~10 s warm.
-- `swift test` — 124 tests; must stay offline and must never touch the real
+- `swift test` — 139 tests; must stay offline and must never touch the real
   data dir (fixture dirs only). ffmpeg/AEC-dependent tests skip themselves
   where those are not installed.
 - `bash bundle.sh` — builds MemorAI.app and codesigns it (stable identity so
@@ -50,7 +50,10 @@ per-day `index.jsonl` (one JSON record per screenshot; legacy per-shot
 Work files live in the same folder and are NOT recordings: `_mic.part<N>.m4a`
 / `.caf` (segments awaiting the stitcher), `_mic.stitching.m4a`,
 `_screen.muxing.mp4` (ffmpeg temporaries), `_session.json` (the post-processing
-manifest, present only while a session is unfinished). `_mic.aec.m4a` IS data —
+manifest, present only while a session is unfinished), `_track_<tag>_*.wav` /
+`_chunk_<tag>_*.wav` / `_whisper_<tag>_*.json` (the transcription's per-chunk
+cache; the JSONs outlive a pause on purpose and are swept when the transcript
+is written or the session is given up on). `_mic.aec.m4a` IS data —
 the echo-cancelled mic, kept next to the raw one.
 
 ## Call pipeline
@@ -74,7 +77,16 @@ sidecar on top of a live call is what made the speakers crackle mid-conversation
 (measured 2026-08-19: whisper 08:17:53–08:25:41 across a call recorded
 08:20:12–08:33:34). A stage cut short must NOT be recorded as done — an
 interrupted AEC otherwise passes for "declined" and the call keeps the raw mic
-forever. Post-processing children run through `ProcessRunner` with
+forever, and an interrupted transcription for a finished transcript with a
+ten-minute hole in it. The gate is checked between stages AND inside the
+transcription's own chunk loop — killing the child in flight only frees the
+machine until the next chunk starts, and a long call is dozens of whisper runs
+(measured 2026-09-01: a 4.4 h call's transcription ran straight through the
+whole of the next call). Each chunk's whisper JSON stays on disk until the
+transcript is written, so a resumed run costs the interrupted chunk, not the
+hours before it; a chunk whisper fails on gets one retry, and a chunk lost
+after that is logged with the timestamps it covers rather than silently
+dropped. Post-processing children run through `ProcessRunner` with
 `role: .postProcessing` (utility QoS + nice 10, cancellable as a group);
 `.background` was measured at 2.6x slower and is not worth it now that the gate
 removes the overlap. Screen memory + OCR and dictation (its third audio engine

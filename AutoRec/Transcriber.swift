@@ -75,14 +75,27 @@ class Transcriber {
     /// host-clock starts of the three files; they put both transcripts on one
     /// timeline. Omitting them transcribes each track from its own zero, which
     /// mis-orders the dialogue by however far apart the recorders started.
+    ///
+    /// `shouldPause` is asked before every chunk. A transcription is the
+    /// longest thing the app does — dozens of whisper runs over hours — so the
+    /// recording gate has to reach inside the loop: cancelling the child in
+    /// flight only frees the machine until the next chunk starts. Finished
+    /// chunks are kept on disk, so the resumed run costs the interrupted chunk
+    /// and nothing more.
+    ///
+    /// `completion` reports whether the transcript is settled. `false` means
+    /// the run paused for a recording and must be resumed — the caller must not
+    /// record the stage as done on it.
     func transcribeSession(micURL: URL?, systemURL: URL?, namingURL: URL? = nil,
                            micStartSeconds: Double? = nil, systemStartSeconds: Double? = nil,
                            videoStartSeconds: Double? = nil,
-                           completion: @escaping () -> Void) {
+                           shouldPause: @escaping () -> Bool = { false },
+                           completion: @escaping (Bool) -> Void) {
         transcriptionQueue.async { [self] in
+            func finish(_ settled: Bool) { DispatchQueue.main.async { completion(settled) } }
             guard isAvailable, let wp = resolvedWhisperPath else {
                 log("[Transcriber] whisper-cli or model not found — skipping (whisper: \(resolvedWhisperPath ?? "not found"), model: \(resolvedModelPath))")
-                DispatchQueue.main.async { completion() }
+                finish(true)
                 return
             }
             let whisperExec = wp
@@ -97,7 +110,7 @@ class Transcriber {
 
             guard micOK || sysOK else {
                 log("[Transcriber] Both tracks too short — skipping transcription")
-                DispatchQueue.main.async { completion() }
+                finish(true)
                 return
             }
 
@@ -120,7 +133,7 @@ class Transcriber {
 
             if FileManager.default.fileExists(atPath: txtPath.path) {
                 log("[Transcriber] Transcript already exists: \(txtPath.lastPathComponent)")
-                DispatchQueue.main.async { completion() }
+                finish(true)
                 return
             }
 
@@ -129,10 +142,24 @@ class Transcriber {
 
             if micOK && sysOK {
                 log("[Transcriber] [\(sessionTag)] Dual-track transcription (speaker-labeled, model: \((modelFile as NSString).lastPathComponent))")
-                let micSegs = transcribeTrack(micURL!, roleTag: "mic", whisperExec: whisperExec,
-                                              modelFile: modelFile, lang: lang, dir: dir, sessionTag: sessionTag)
-                let sysSegs = transcribeTrack(systemURL!, roleTag: "system", whisperExec: whisperExec,
-                                              modelFile: modelFile, lang: lang, dir: dir, sessionTag: sessionTag)
+                let micOutcome = transcribeTrack(micURL!, roleTag: "mic", whisperExec: whisperExec,
+                                                 modelFile: modelFile, lang: lang, dir: dir,
+                                                 sessionTag: sessionTag, shouldPause: shouldPause)
+                if case .paused = micOutcome {
+                    log("[Transcriber] [\(sessionTag)] ⏸ Paused for a recording — resumes from the finished chunks")
+                    finish(false)
+                    return
+                }
+                let sysOutcome = transcribeTrack(systemURL!, roleTag: "system", whisperExec: whisperExec,
+                                                 modelFile: modelFile, lang: lang, dir: dir,
+                                                 sessionTag: sessionTag, shouldPause: shouldPause)
+                if case .paused = sysOutcome {
+                    log("[Transcriber] [\(sessionTag)] ⏸ Paused for a recording — resumes from the finished chunks")
+                    finish(false)
+                    return
+                }
+                let micSegs = micOutcome.segments
+                let sysSegs = sysOutcome.segments
                 if let micSegs = micSegs, let sysSegs = sysSegs, !(micSegs.isEmpty && sysSegs.isEmpty) {
                     let offsets = AudioMuxer.computeOffsets(micStart: micStartSeconds,
                                                             systemStart: systemStartSeconds,
@@ -146,16 +173,30 @@ class Transcriber {
                         system: Self.shifted(sysSegs, bySeconds: offsets.system))
                 } else {
                     log("[Transcriber] [\(sessionTag)] ⚠️ Dual-track path failed — falling back to merged mix")
-                    fullTranscript = transcribeMergedMix(
+                    let mixed = transcribeMergedMix(
                         micURL: micURL, systemURL: systemURL, micOK: micOK, sysOK: sysOK,
                         whisperExec: whisperExec, modelFile: modelFile, lang: lang,
-                        dir: dir, baseName: baseName, sessionTag: sessionTag)
+                        dir: dir, baseName: baseName, sessionTag: sessionTag,
+                        shouldPause: shouldPause)
+                    if mixed.paused {
+                        log("[Transcriber] [\(sessionTag)] ⏸ Paused for a recording — resumes later")
+                        finish(false)
+                        return
+                    }
+                    fullTranscript = mixed.text
                 }
             } else {
-                fullTranscript = transcribeMergedMix(
+                let mixed = transcribeMergedMix(
                     micURL: micURL, systemURL: systemURL, micOK: micOK, sysOK: sysOK,
                     whisperExec: whisperExec, modelFile: modelFile, lang: lang,
-                    dir: dir, baseName: baseName, sessionTag: sessionTag)
+                    dir: dir, baseName: baseName, sessionTag: sessionTag,
+                    shouldPause: shouldPause)
+                if mixed.paused {
+                    log("[Transcriber] [\(sessionTag)] ⏸ Paused for a recording — resumes later")
+                    finish(false)
+                    return
+                }
+                fullTranscript = mixed.text
             }
 
             if !fullTranscript.isEmpty {
@@ -165,19 +206,46 @@ class Transcriber {
             } else {
                 log("[Transcriber] ❌ Whisper produced no output")
             }
+            // The per-chunk records only exist to survive a pause; the
+            // transcript is written, so they are just disk now.
+            Self.discardPartials(tag: sessionTag, in: dir)
 
-            DispatchQueue.main.async { completion() }
+            finish(true)
         }
     }
 
     // MARK: - Dual-track (speaker-labeled) transcription
 
+    /// How a track's transcription ended.
+    enum TrackOutcome {
+        case done([TranscriptSegment])
+        /// A recording started mid-track. The chunks that finished are cached
+        /// on disk; the resumed run starts at the first one that is not.
+        case paused
+        /// The track could not be prepared at all (ffmpeg convert failed).
+        case failed
+
+        /// Segments if the track ran to the end, nil otherwise — the callers
+        /// that only distinguish "usable" from "not" read this.
+        var segments: [TranscriptSegment]? {
+            if case .done(let segs) = self { return segs }
+            return nil
+        }
+    }
+
     /// Transcribe a single track into timestamped segments. Applies loudnorm,
     /// resamples to 16 kHz mono, chunks long audio (10 min) and parses
-    /// whisper's JSON output. Returns nil on hard failure (ffmpeg convert failed).
+    /// whisper's JSON output.
+    ///
+    /// Each chunk's whisper JSON is left on disk until the whole transcript is
+    /// written, so a run cut short by a recording resumes at the chunk it lost
+    /// instead of redoing hours of inference.
     private func transcribeTrack(_ sourceURL: URL, roleTag: String, whisperExec: String,
                                  modelFile: String, lang: String, dir: URL,
-                                 sessionTag: String) -> [TranscriptSegment]? {
+                                 sessionTag: String,
+                                 shouldPause: () -> Bool = { false }) -> TrackOutcome {
+        if shouldPause() { return .paused }
+
         let trackWav = dir.appendingPathComponent("_track_\(sessionTag)_\(roleTag).wav")
         defer { try? FileManager.default.removeItem(at: trackWav) }
 
@@ -187,18 +255,37 @@ class Transcriber {
             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
             trackWav.path
         ])
+        if convert.wasCancelled { return .paused }
         guard convert.exitCode == 0 else {
             log("[Transcriber] [\(sessionTag)] ❌ ffmpeg convert (\(roleTag)) failed (exit \(convert.exitCode)): \(convert.stderr.suffix(300))")
-            return nil
+            return .failed
         }
 
         let duration = trackDuration(trackWav)
         let chunkSec = 600.0
         let chunks = duration <= chunkSec * 1.5 ? 1 : Int(ceil(duration / chunkSec))
         var segments: [TranscriptSegment] = []
+        var gaps = 0
 
         for i in 0..<chunks {
             let offsetMs = i * Int(chunkSec) * 1000
+            let outBase = dir.appendingPathComponent("_whisper_\(sessionTag)_\(roleTag)_\(i)")
+            let jsonURL = outBase.appendingPathExtension("json")
+
+            // A chunk an earlier, interrupted run already got through: whisper
+            // only writes this file after a clean exit, so parsing it is the
+            // whole of the work.
+            if let cached = Self.parseWhisperJSON(jsonURL, offsetMs: offsetMs) {
+                log("[Transcriber] [\(sessionTag)]   \(roleTag) chunk \(i+1)/\(chunks) — reusing an earlier run")
+                segments += cached
+                continue
+            }
+
+            if shouldPause() {
+                log("[Transcriber] [\(sessionTag)] \(roleTag) paused before chunk \(i+1)/\(chunks)")
+                return .paused
+            }
+
             let chunkWav: URL
             if chunks == 1 {
                 chunkWav = trackWav
@@ -209,42 +296,79 @@ class Transcriber {
                     "-ss", String(i * Int(chunkSec)), "-t", String(Int(chunkSec)),
                     "-c:a", "pcm_s16le", extracted.path
                 ])
+                if extract.wasCancelled { return .paused }
                 guard extract.exitCode == 0 else {
                     log("[Transcriber] [\(sessionTag)] ⚠️ \(roleTag) chunk \(i+1) extraction failed, skipping")
+                    gaps += 1
                     continue
                 }
                 chunkWav = extracted
             }
+            defer { if chunks > 1 { try? FileManager.default.removeItem(at: chunkWav) } }
 
-            if chunks > 1 {
-                log("[Transcriber] [\(sessionTag)]   \(roleTag) chunk \(i+1)/\(chunks)…")
-            } else {
-                log("[Transcriber] [\(sessionTag)]   \(roleTag) track (\(Int(duration))s)…")
-            }
-            let outBase = dir.appendingPathComponent("_whisper_\(sessionTag)_\(roleTag)_\(i)")
-            let jsonURL = outBase.appendingPathExtension("json")
-            let result = runProcess(whisperExec, args: [
-                "-m", modelFile, "-l", lang,
-                // Two threads, not all of them: even gated out of live calls,
-                // whisper shares the machine with whatever the user is doing.
-                "-t", "2",
-                "-et", "2.2", "-lpt", "-0.5",
-                "-oj", "-of", outBase.path,
-                chunkWav.path
-            ])
-
-            if result.exitCode == 0, let segs = Self.parseWhisperJSON(jsonURL, offsetMs: offsetMs) {
-                segments += segs
-            } else {
+            // One retry: a whisper that fell over on its own usually survives a
+            // second run, and the alternative is a silent ten-minute hole in
+            // the middle of the transcript.
+            var parsed: [TranscriptSegment]?
+            for attempt in 1...2 {
+                let retry = attempt > 1 ? " (retry)" : ""
+                if chunks > 1 {
+                    log("[Transcriber] [\(sessionTag)]   \(roleTag) chunk \(i+1)/\(chunks)\(retry)…")
+                } else {
+                    log("[Transcriber] [\(sessionTag)]   \(roleTag) track (\(Int(duration))s)\(retry)…")
+                }
+                let result = runProcess(whisperExec, args: [
+                    "-m", modelFile, "-l", lang,
+                    // Two threads, not all of them: even gated out of live calls,
+                    // whisper shares the machine with whatever the user is doing.
+                    "-t", "2",
+                    "-et", "2.2", "-lpt", "-0.5",
+                    "-oj", "-of", outBase.path,
+                    chunkWav.path
+                ])
+                if result.wasCancelled {
+                    // Killed mid-write: whatever is there must not pass for a
+                    // finished chunk when this session is picked back up.
+                    try? FileManager.default.removeItem(at: jsonURL)
+                    log("[Transcriber] [\(sessionTag)] \(roleTag) paused during chunk \(i+1)/\(chunks)")
+                    return .paused
+                }
+                if result.exitCode == 0, let segs = Self.parseWhisperJSON(jsonURL, offsetMs: offsetMs) {
+                    parsed = segs
+                    break
+                }
                 log("[Transcriber] [\(sessionTag)] ⚠️ \(roleTag) chunk \(i+1) whisper failed (exit \(result.exitCode))")
+                try? FileManager.default.removeItem(at: jsonURL)
+                if shouldPause() { return .paused }
             }
 
-            try? FileManager.default.removeItem(at: jsonURL)
-            if chunks > 1 { try? FileManager.default.removeItem(at: chunkWav) }
+            if let parsed = parsed {
+                segments += parsed
+            } else {
+                gaps += 1
+                let from = Self.timestamp(ms: offsetMs)
+                let to = Self.timestamp(ms: offsetMs + Int(chunkSec) * 1000)
+                log("[Transcriber] [\(sessionTag)] ❌ \(roleTag) chunk \(i+1)/\(chunks) lost after 2 attempts — \(from)–\(to) is missing from the transcript")
+            }
         }
 
-        return segments
+        if gaps > 0 {
+            log("[Transcriber] [\(sessionTag)] ⚠️ \(roleTag) track finished with \(gaps) of \(chunks) chunk(s) missing")
+        }
+        return .done(segments)
     }
+
+    /// Every per-chunk record left over from an interrupted transcription of
+    /// `tag`. Kept only between a pause and the resume that uses them.
+    static func discardPartials(tag: String, in dir: URL) {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        for name in names where name.hasPrefix("_whisper_\(tag)_")
+                             || name.hasPrefix("_chunk_\(tag)_")
+                             || name.hasPrefix("_track_\(tag)_") {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
+        }
+    }
+
 
     /// Parse whisper-cli -oj output into segments, shifting offsets by `offsetMs`.
     /// Drops empty segments and non-speech annotations like "[BLANK_AUDIO]" or "(music)".
@@ -415,12 +539,16 @@ class Transcriber {
     }
 
     static func formatDialogueLine(startMs: Int, speaker: String, text: String) -> String {
-        let totalSec = startMs / 1000
+        return "[\(timestamp(ms: startMs))] \(speaker): \(text)"
+    }
+
+    /// Offset from the start of the call as it reads in the transcript.
+    static func timestamp(ms: Int) -> String {
+        let totalSec = ms / 1000
         let h = totalSec / 3600
         let m = (totalSec % 3600) / 60
         let s = totalSec % 60
-        let ts = h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
-        return "[\(ts)] \(speaker): \(text)"
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
     }
 
     // MARK: - Merged-mix (single-speaker) transcription
@@ -430,7 +558,9 @@ class Transcriber {
     /// dual-track path fails.
     private func transcribeMergedMix(micURL: URL?, systemURL: URL?, micOK: Bool, sysOK: Bool,
                                      whisperExec: String, modelFile: String, lang: String,
-                                     dir: URL, baseName: String, sessionTag: String) -> String {
+                                     dir: URL, baseName: String, sessionTag: String,
+                                     shouldPause: () -> Bool = { false })
+                                     -> (text: String, paused: Bool) {
         let mergedWav = dir.appendingPathComponent(
             baseName.replacingOccurrences(of: "_mic", with: "_merged")
                     .replacingOccurrences(of: "_system", with: "_merged") + ".wav"
@@ -463,9 +593,10 @@ class Transcriber {
             ])
         }
 
+        if convertResult.wasCancelled { return ("", true) }
         guard convertResult.exitCode == 0 else {
             log("[Transcriber] ❌ ffmpeg merge failed (exit \(convertResult.exitCode)): \(convertResult.stderr.suffix(500))")
-            return ""
+            return ("", false)
         }
 
         let duration = trackDuration(mergedWav)
@@ -484,6 +615,10 @@ class Transcriber {
                 "-otxt", "-of", tmpBase.path,
                 mergedWav.path
             ])
+            if result.wasCancelled {
+                try? FileManager.default.removeItem(at: tmpBase.appendingPathExtension("txt"))
+                return ("", true)
+            }
             if result.exitCode == 0,
                let text = try? String(contentsOf: tmpBase.appendingPathExtension("txt"), encoding: .utf8) {
                 fullTranscript = text
@@ -496,6 +631,10 @@ class Transcriber {
             log("[Transcriber] [\(sessionTag)] Transcribing \(chunks) chunks (\(Int(duration))s total, model: \((modelFile as NSString).lastPathComponent))...")
 
             for i in 0..<chunks {
+                if shouldPause() {
+                    log("[Transcriber] [\(sessionTag)] paused before chunk \(i+1)/\(chunks)")
+                    return ("", true)
+                }
                 let offset = Double(i) * chunkSec
                 let chunkWav = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i).wav")
                 let chunkBase = dir.appendingPathComponent("_chunk_\(sessionTag)_\(i)")
@@ -505,6 +644,7 @@ class Transcriber {
                     "-ss", String(Int(offset)), "-t", String(Int(chunkSec)),
                     "-c:a", "pcm_s16le", chunkWav.path
                 ])
+                if extractResult.wasCancelled { return ("", true) }
                 guard extractResult.exitCode == 0 else {
                     log("[Transcriber] [\(sessionTag)] ⚠️ Chunk \(i+1) extraction failed, skipping")
                     continue
@@ -518,6 +658,11 @@ class Transcriber {
                     chunkWav.path
                 ])
 
+                if result.wasCancelled {
+                    try? FileManager.default.removeItem(at: chunkWav)
+                    try? FileManager.default.removeItem(at: chunkBase.appendingPathExtension("txt"))
+                    return ("", true)
+                }
                 if result.exitCode == 0,
                    let text = try? String(contentsOf: chunkBase.appendingPathExtension("txt"), encoding: .utf8) {
                     fullTranscript += text
@@ -530,7 +675,7 @@ class Transcriber {
             }
         }
 
-        return fullTranscript
+        return (fullTranscript, false)
     }
 
     /// Get media file duration in seconds via ffmpeg. Returns 0 on failure or missing file.
@@ -664,6 +809,9 @@ class Transcriber {
         let exitCode: Int32
         let stdout: String
         let stderr: String
+
+        /// Stopped to get out of a live call's way — not a failure of the work.
+        var wasCancelled: Bool { exitCode == ProcessRunner.Result.cancelledCode }
     }
 
     /// Run a subprocess as post-processing work: background priority, and
