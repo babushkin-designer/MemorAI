@@ -106,6 +106,47 @@ final class TranscriberPauseTests: XCTestCase {
         XCTAssertEqual(left, [], "chunk cache outlived the transcript")
     }
 
+    /// A prepared track must not be reused unless it is whole. A truncated one
+    /// (a kill or a timeout mid-convert) is far bigger than any header, so size
+    /// cannot tell them apart — only the rename can, which is why the convert
+    /// writes under a work name.
+    func testATruncatedPreparedTrackIsNotReused() throws {
+        try requireTools()
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tag = "2026-01-05_00-00-00"
+        let mic = dir.appendingPathComponent("call_\(tag)_mic.m4a")
+        let sys = dir.appendingPathComponent("call_\(tag)_system.m4a")
+        makeTone(mic, seconds: 4, frequency: 440)
+        makeTone(sys, seconds: 4, frequency: 880)
+
+        // What a convert killed halfway leaves behind: a real wav header and a
+        // fraction of the samples.
+        let truncated = dir.appendingPathComponent("_track_\(tag)_mic.wav")
+        XCTAssertEqual(ProcessRunner.run(ffmpeg, args: [
+            "-y", "-v", "error", "-i", mic.path, "-t", "1",
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", truncated.path]).exitCode, 0)
+        let truncatedSize = try FileManager.default
+            .attributesOfItem(atPath: truncated.path)[.size] as? Int ?? 0
+
+        try seedChunkJSON(dir.appendingPathComponent("_whisper_\(tag)_mic_0.json"), text: "речь")
+        try seedChunkJSON(dir.appendingPathComponent("_whisper_\(tag)_system_0.json"), text: "ответ")
+
+        let done = expectation(description: "transcription returns")
+        Transcriber.shared.transcribeSession(micURL: mic, systemURL: sys) { _ in done.fulfill() }
+        wait(for: [done], timeout: 120)
+
+        // The stranded file was replaced by a full conversion of the 4 s track,
+        // not adopted as if it were one.
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("_track_\(tag)_mic.part.wav").path),
+            "the work file must not be left behind")
+        let text = try String(contentsOf: dir.appendingPathComponent("call_\(tag)_transcript.txt"),
+                              encoding: .utf8)
+        XCTAssertTrue(text.contains("речь"), text)
+        XCTAssertGreaterThan(truncatedSize, 44, "fixture must be a plausible truncation, not an empty header")
+    }
+
     /// Retention has to be able to reclaim a cache stranded by a quit during a
     /// pause — nothing else will, and these names do not start with `call_`.
     func testTheChunkCacheIsAKnownWorkFileWithAKnownSession() {

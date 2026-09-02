@@ -426,7 +426,10 @@ extension SystemAudioRecorder: SCStreamOutput {
                     _stats.audioMaxGapSeconds = max(_stats.audioMaxGapSeconds, gap)
                 }
             }
-            if duration.isFinite, duration > 0 { _stats.audioExpectedEnd = start + duration }
+            // Always advance, even when the buffer reports no usable duration:
+            // leaving the cursor behind makes the NEXT buffer look like it
+            // arrived after a hole that spans this one too.
+            _stats.audioExpectedEnd = start + (duration.isFinite && duration > 0 ? duration : 0)
         }
     }
 

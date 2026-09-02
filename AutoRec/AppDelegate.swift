@@ -15,10 +15,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         screenMemory.stop()
         dictation?.shutdown()
         // whisper, ffmpeg and the AEC sidecar are ours; without this they
-        // outlive the app and keep working for a parent that is gone. Every
-        // stage they were in is recorded in the manifest and resumed at the
-        // next launch, so stopping them costs nothing.
-        ProcessRunner.cancelPostProcessing(reason: "quitting")
+        // outlive the app and keep working for a parent that is gone. Suspend
+        // rather than cancel: killing the child in flight leaves the pipeline
+        // free to spawn the next one in the moments before the process
+        // actually exits, which orphans it just the same. Every stage they
+        // were in is recorded in the manifest and resumed at the next launch.
+        ProcessRunner.suspendPostProcessing(reason: "quitting")
         let state = recordingManager?.state ?? .idle
         guard state == .recording || state == .starting || state == .paused || state == .stopping else {
             return .terminateNow

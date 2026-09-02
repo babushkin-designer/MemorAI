@@ -246,20 +246,31 @@ class Transcriber {
         // pause — to reach exactly the state it was already in.
         let trackWav = dir.appendingPathComponent("_track_\(sessionTag)_\(roleTag).wav")
 
-        if !Self.hasAudio(at: trackWav) {
+        if !FileManager.default.fileExists(atPath: trackWav.path) {
+            // Convert under a work name and rename, so `_track_…wav` exists only
+            // when it holds the WHOLE track — the same rule `call_<tag>_mic.m4a`
+            // follows. A size check cannot tell a finished 500 MB wav from one
+            // truncated by a kill or a timeout, and reusing a truncated one
+            // would transcribe part of the call and settle the stage on it.
+            // `.part.wav`, not `.wav.part`: ffmpeg picks its muxer from the
+            // extension, and an unknown one makes the convert fail outright.
+            let partial = dir.appendingPathComponent("_track_\(sessionTag)_\(roleTag).part.wav")
+            defer { try? FileManager.default.removeItem(at: partial) }
             let convert = runProcess(ffmpegPath, args: [
                 "-y", "-nostats", "-loglevel", "error", "-i", sourceURL.path,
                 "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
                 "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-                trackWav.path
+                partial.path
             ])
-            if convert.wasCancelled {
-                // A half-written wav must not pass for a prepared track.
-                try? FileManager.default.removeItem(at: trackWav)
-                return .paused
-            }
+            if convert.wasCancelled { return .paused }
             guard convert.exitCode == 0 else {
                 log("[Transcriber] [\(sessionTag)] ❌ ffmpeg convert (\(roleTag)) failed (exit \(convert.exitCode)): \(convert.stderrTail)")
+                return .failed
+            }
+            do {
+                try FileManager.default.moveItem(at: partial, to: trackWav)
+            } catch {
+                log("[Transcriber] [\(sessionTag)] ❌ Could not publish the prepared \(roleTag) track: \(error.localizedDescription)")
                 return .failed
             }
         }
@@ -347,14 +358,6 @@ class Transcriber {
             log("[Transcriber] [\(sessionTag)] ⚠️ \(roleTag) track finished with \(gaps) of \(chunks) chunk(s) missing")
         }
         return .done(segments)
-    }
-
-    /// A prepared wav that actually holds samples. A convert killed partway
-    /// leaves a header and little else, and reusing that would silently
-    /// transcribe a fraction of the call.
-    private static func hasAudio(at url: URL) -> Bool {
-        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int ?? 0
-        return size > 44 * 1024
     }
 
     /// Every per-chunk record left over from an interrupted transcription of

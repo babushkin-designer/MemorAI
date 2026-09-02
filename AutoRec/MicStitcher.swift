@@ -179,7 +179,8 @@ class MicStitcher {
         // process exit — so it needs a deadline, not an open-ended wait.
         let result = ProcessRunner.run(ffmpegPath, args: args, timeout: 900, role: .postProcessing)
         guard result.exitCode == 0 else {
-            let why = result.timedOut ? "timed out" : "exit \(result.exitCode)"
+            let why = result.wasCancelled ? "not started (a recording began)"
+                : result.timedOut ? "timed out" : "exit \(result.exitCode)"
             log("[MicStitcher] ❌ ffmpeg failed (\(why)): \(result.stderrTail)")
             log("[MicStitcher] Segments kept on disk for recovery: \(usable.map { $0.url.lastPathComponent }.joined(separator: ", "))")
             try? FileManager.default.removeItem(at: tempURL)

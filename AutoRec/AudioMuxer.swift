@@ -174,7 +174,8 @@ class AudioMuxer {
         // malformed input — exactly when the error text is worth having.
         let result = ProcessRunner.run(ffmpegPath, args: args, timeout: 1800, role: .postProcessing)
         guard result.exitCode == 0 else {
-            let why = result.timedOut ? "timed out" : "exit \(result.exitCode)"
+            let why = result.wasCancelled ? "not started (a recording began)"
+                : result.timedOut ? "timed out" : "exit \(result.exitCode)"
             log("[AudioMuxer] ❌ ffmpeg failed (\(why)): \(result.stderrTail)")
             try? FileManager.default.removeItem(at: tempURL)
             return false
