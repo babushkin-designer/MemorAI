@@ -73,10 +73,40 @@ class RetentionManager {
     /// (mic/system/screen/transcript) are the user's data and are never touched
     /// here — deleting a recording is the user's call, not a timer's.
     static func isCallWorkFile(_ name: String) -> Bool {
+        if transcriptionCacheTag(name) != nil { return true }
         guard name.hasPrefix("call_") else { return false }
         return name.hasSuffix(".stitching.m4a")
             || name.hasSuffix(".muxing.mp4")
             || (name.range(of: "_mic.part") != nil)
+    }
+
+    /// The transcription's resume cache: `_track_<tag>_<role>.wav`,
+    /// `_chunk_<tag>_<role>_<i>.wav`, `_whisper_<tag>_<role>_<i>.json`.
+    ///
+    /// Unlike everything else here these do not start with `call_`, and they
+    /// are meant to outlive a process — a transcription paused for a recording
+    /// resumes off them. Which is exactly why they need an owner: nothing else
+    /// reclaims one stranded by a quit in the middle of a pause.
+    static let transcriptionCachePrefixes = ["_track_", "_chunk_", "_whisper_"]
+
+    /// Names of that cache for one session. `Transcriber.discardPartials`
+    /// sweeps by these the moment the transcript exists.
+    static func transcriptionCachePrefixes(tag: String) -> [String] {
+        transcriptionCachePrefixes.map { $0 + tag + "_" }
+    }
+
+    /// The session a cache file belongs to, or nil when it is not one. Tags are
+    /// `YYYY-MM-DD_HH-mm-ss`, so the boundary is a fixed width rather than a
+    /// separator — the tag contains the separator itself.
+    static func transcriptionCacheTag(_ name: String) -> String? {
+        guard let prefix = transcriptionCachePrefixes.first(where: { name.hasPrefix($0) }) else {
+            return nil
+        }
+        let rest = name.dropFirst(prefix.count)
+        let tag = String(rest.prefix(19))
+        guard tag.count == 19, rest.count > 19, rest[rest.index(rest.startIndex, offsetBy: 19)] == "_",
+              tag.allSatisfy({ $0.isNumber || $0 == "-" || $0 == "_" }) else { return nil }
+        return tag
     }
 
     /// A stitch that never succeeded leaves its parts behind on purpose, so
@@ -92,7 +122,8 @@ class RetentionManager {
         let cutoff = Date().addingTimeInterval(-Double(retentionDays) * 86400)
         var removed = 0
         for name in names where Self.isCallWorkFile(name) {
-            if let tag = CallHistory.parse(filename: name)?.tag, pendingTags.contains(tag) { continue }
+            let tag = Self.transcriptionCacheTag(name) ?? CallHistory.parse(filename: name)?.tag
+            if let tag = tag, pendingTags.contains(tag) { continue }
             let url = base.appendingPathComponent(name)
             guard let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey])
                 .contentModificationDate, mtime < cutoff else { continue }

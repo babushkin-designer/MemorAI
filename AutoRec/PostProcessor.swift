@@ -29,6 +29,54 @@ final class PostProcessor {
     /// Blocks until everything queued so far has run.
     func waitUntilIdle() { queue.sync {} }
 
+    // MARK: - The recording gate
+
+    /// Guards `_recordingActive` alone. Deliberately NOT `queue`: the gate is
+    /// closed from the main thread at the start of a call, and `queue` can be
+    /// sitting inside a whisper run for minutes.
+    private let gateLock = NSLock()
+    private var _recordingActive = false
+
+    private var isRecordingActive: Bool { gateLock.withLock { _recordingActive } }
+
+    /// Open or close the gate. While it is closed nothing heavy runs: the
+    /// pipeline stops between stages, and the child process in flight is
+    /// terminated.
+    ///
+    /// Post-processing a previous call used to overlap the next one — measured
+    /// on 2026-08-19, whisper ran from 08:17:53 to 08:25:41 across a call that
+    /// started at 08:20:12 — and that load is what makes the speakers crackle
+    /// mid-conversation. The pipeline is resumable off its manifest, so the
+    /// interruption costs only the stage in flight; the call cannot be redone.
+    func setRecordingActive(_ active: Bool, dir: URL) {
+        gateLock.lock()
+        let changed = _recordingActive != active
+        _recordingActive = active
+        gateLock.unlock()
+        guard changed else { return }
+
+        if active {
+            // Suspend, not just cancel: the runner then refuses to start the
+            // next chunk too, so a stage in the middle of dozens of whisper
+            // runs stops at the first one instead of at the last.
+            ProcessRunner.suspendPostProcessing(reason: "recording started")
+            log("[PostProcessor] Gate closed — no post-processing while recording")
+        } else {
+            ProcessRunner.resumePostProcessing()
+            log("[PostProcessor] Gate open — resuming any deferred session")
+            // A moment of quiet after a call: the recorders have just finalized
+            // their files, and starting whisper in the same breath would put
+            // the load right back on the machine the user may still be on.
+            queue.asyncAfter(deadline: .now() + gateReopenDelay) { [weak self] in
+                self?.resumePending(in: dir)
+            }
+        }
+    }
+
+    /// A moment of quiet after a call before the pipeline starts up again.
+    /// `var` so the tests do not have to wait it out.
+    var gateReopenDelay: TimeInterval = 15
+
     /// True while a transcription is running (drives the menu bar label).
     private(set) var isTranscribing = false
     var onTranscribingChanged: ((Bool) -> Void)?
@@ -86,21 +134,62 @@ final class PostProcessor {
     // MARK: - The pipeline
 
     private func run(manifest input: CallSessionManifest, in dir: URL) {
+        guard !isRecordingActive else {
+            log("[PostProcessor] Recording in progress — \(input.tag) waits (manifest stays on disk)")
+            return
+        }
+
         var manifest = input
         manifest.attempts += 1
         let attempt = manifest.attempts
         manifest.save(in: dir)
 
-        publishMicTrack(&manifest, in: dir)
-        cancelEcho(&manifest, in: dir)
-        muxVideo(&manifest, in: dir)
-        transcribe(&manifest, in: dir)
+        // Name the stage while it runs: these are the heaviest things the app
+        // does, and when one of them lands on top of a live call the glitch
+        // monitor's overload lines say so by name.
+        let steps: [(String, (inout CallSessionManifest, URL) -> Void)] = [
+            ("stitch", publishMicTrack),
+            ("aec", cancelEcho),
+            ("mux", muxVideo),
+            ("whisper", transcribe),
+        ]
+        // Stages that finished on their own merits. A stage cut short by a
+        // recording must not be recorded as done — an interrupted AEC otherwise
+        // passes for "echo cancellation declined" and the call keeps the raw
+        // mic forever, and an interrupted whisper for a finished transcript.
+        var completed = input.stages
+        var interrupted = false
+        _ = ProcessRunner.consumeCancellation()
+
+        for (name, step) in steps {
+            if isRecordingActive { interrupted = true; break }
+            AudioGlitchMonitor.shared.setStage("\(name) \(manifest.tag)")
+            step(&manifest, dir)
+            if ProcessRunner.consumeCancellation() || isRecordingActive {
+                manifest.stages = completed
+                interrupted = true
+                log("[PostProcessor] Stage \(name) for \(manifest.tag) cut short by a recording")
+                break
+            }
+            completed = manifest.stages
+        }
+        AudioGlitchMonitor.shared.setStage(nil)
+
+        if interrupted {
+            // Not a failed attempt — the work never got to fail. Charging it
+            // would burn the session's retries on interruptions alone.
+            manifest.attempts = input.attempts
+            manifest.save(in: dir)
+            log("[PostProcessor] ⏸ \(manifest.tag) deferred until the recording ends (stages: \(manifest.stages))")
+            return
+        }
 
         if manifest.stages.allDone {
             manifest.remove(in: dir)
             log("[PostProcessor] Session \(manifest.tag) complete")
         } else if attempt >= CallSessionManifest.maxAttempts {
             manifest.remove(in: dir)
+            Transcriber.discardPartials(tag: manifest.tag, in: dir)
             log("[PostProcessor] ⚠️ Session \(manifest.tag) still unfinished after \(attempt) attempts — giving up (stages: \(manifest.stages))")
         } else {
             manifest.save(in: dir)
@@ -224,6 +313,7 @@ final class PostProcessor {
         setTranscribing(true)
         log("[PostProcessor] Starting transcription for \(manifest.tag)…")
         let done = DispatchSemaphore(value: 0)
+        var settled = false
         // Transcribe the cleaned mic but keep naming the session after the
         // canonical file, or the transcript lands next to it under a mangled
         // name. Offsets put both tracks on one timeline so the speaker-labeled
@@ -233,11 +323,19 @@ final class PostProcessor {
                                              namingURL: manifest.resolve(manifest.micFile, in: dir),
                                              micStartSeconds: manifest.micStartSeconds,
                                              systemStartSeconds: manifest.systemStartSeconds,
-                                             videoStartSeconds: manifest.videoStartSeconds) {
+                                             videoStartSeconds: manifest.videoStartSeconds) { finished in
+            settled = finished
             done.signal()
         }
         done.wait()
         setTranscribing(false)
+        // Paused for a recording: the finished chunks are on disk and the stage
+        // stays open. Recording it as done here would leave the call with the
+        // half of the transcript that happened to be ready.
+        guard settled else {
+            log("[PostProcessor] Transcription for \(manifest.tag) paused — resumes after the recording")
+            return
+        }
         manifest.stages.transcribed = true
         manifest.save(in: dir)
         log("[PostProcessor] Transcription complete for \(manifest.tag)")

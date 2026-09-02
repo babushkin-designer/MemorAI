@@ -30,6 +30,27 @@ class ScreenMemoryManager {
     /// a minute), so the tick is skipped until the screen is back.
     private var screenOff = false
 
+    /// Set while a call is being recorded. Screenshots are cheap, but the OCR
+    /// sidecar behind them is not, and a call is the one time the machine has
+    /// a hard real-time deadline to meet. The frames are not worth a crackling
+    /// conversation — the call has its own screen recording anyway.
+    private var callPaused = false
+
+    func setCallActive(_ active: Bool) {
+        guard callPaused != active else { return }
+        callPaused = active
+        if active {
+            // Dictation releases its whisper-server for a call; the OCR model
+            // is the same kind of resident weight and does no work either way
+            // while the loop is paused. `ensureSidecar` brings it back after.
+            ocrProcessor.shutdown()
+            log("[ScreenMemory] paused (call recording, OCR sidecar released)")
+        } else {
+            lastSavedHash = 0  // the screen moved on while we were not looking
+            log("[ScreenMemory] resumed (call ended)")
+        }
+    }
+
     func start() {
         guard !isRunning else { return }
         let settings = SettingsManager.shared
@@ -63,6 +84,7 @@ class ScreenMemoryManager {
         clipboardSource = nil
         stopKeyboardMonitoring()
         stopScreenStateMonitoring()
+        ocrProcessor.shutdown()
     }
 
     // MARK: - Screen Lock / Sleep
@@ -106,6 +128,7 @@ class ScreenMemoryManager {
 
         guard settings.screenMemoryEnabled else { return }
         guard !screenOff else { return }
+        guard !callPaused else { return }
 
         // Skip while the user is idle (no input), even if the screen is changing.
         let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState,
@@ -136,9 +159,6 @@ class ScreenMemoryManager {
         let shouldSave = distance > hashThreshold || appChanged || keyThreshold
         guard shouldSave else { return }
 
-        lastSavedHash = currentHash
-        keyPressCount = 0
-
         let now = Date()
         let dayFormatter = DateFormatter()
         dayFormatter.dateFormat = "yyyy-MM-dd"
@@ -156,7 +176,15 @@ class ScreenMemoryManager {
 
         let meta = metadata.collect()
         let savedURL = capturer.saveImage(image, to: imageURL)
-        guard let savedURL = savedURL else { return }
+        guard let savedURL = savedURL else {
+            // Both of these say "this frame is on disk". Setting them before
+            // the write meant a failed save left the screen looking already
+            // captured, and nothing was kept until the screen changed again.
+            log("[ScreenMemory] ❌ Could not write \(imageURL.lastPathComponent) — will try again next tick")
+            return
+        }
+        lastSavedHash = currentHash
+        keyPressCount = 0
 
         var baseRecord = meta
         baseRecord["timestamp"] = ISO8601DateFormatter().string(from: now)
@@ -171,11 +199,21 @@ class ScreenMemoryManager {
 
     private func startClipboardPolling() {
         // Use a GCD timer on the main queue — NSPasteboard.changeCount
-        // only updates reliably on the main thread
+        // only updates reliably on the main thread.
+        //
+        // Twice a second, not once every two: two copies inside one interval
+        // are indistinguishable from one, since all the pasteboard offers is
+        // "the contents changed" plus whatever is there now. Reading the change
+        // count is a cheap IPC call and the contents are only read when it
+        // moves, so the shorter interval costs close to nothing.
+        // Leeway so 172k wakeups a day can be coalesced with other timers —
+        // nothing here needs the tick to land on time, only to happen.
         let source = DispatchSource.makeTimerSource(queue: .main)
-        source.schedule(deadline: .now() + 2, repeating: 2)
+        source.schedule(deadline: .now() + 0.5, repeating: 0.5, leeway: .milliseconds(100))
         source.setEventHandler { [weak self] in
             guard let self = self, self.isRunning, SettingsManager.shared.saveClipboard else { return }
+            // Read lazily: the settings lookup and its array allocation are
+            // only worth paying on the rare tick where the pasteboard moved.
             self.clipboard.checkAndSave(excludedBundleIds: SettingsManager.shared.excludedBundleIds)
         }
         source.resume()

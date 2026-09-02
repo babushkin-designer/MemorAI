@@ -32,6 +32,42 @@ class SystemAudioRecorder: NSObject {
     private var isRecording = false
     var isPaused = false
 
+    // --- Capture health counters (see CaptureStats) ---
+    private let statsLock = UnfairLock()
+    private var _stats = CaptureStats()
+
+    /// What the capture path lost, as opposed to what the speakers lost.
+    ///
+    /// The two are different failures and the fix differs: a PTS gap in the
+    /// SCStream buffers means the capture side missed audio, while an
+    /// `isReadyForMoreMediaData == false` means WE could not write fast enough.
+    /// Neither is what the user hears — that is AudioGlitchMonitor's job — but
+    /// together they say whether a crackling call also cost us the recording.
+    struct CaptureStats {
+        var audioBuffers = 0
+        var audioNotReady = 0
+        var audioGaps = 0
+        var audioGapSeconds = 0.0
+        var audioMaxGapSeconds = 0.0
+        var audioExpectedEnd: Double?
+        var videoFrames = 0
+        var videoNotReady = 0
+        var videoIncomplete = 0
+
+        var summary: String {
+            var parts = ["audio \(audioBuffers) buffers"]
+            if audioGaps > 0 {
+                parts.append(String(format: "%d PTS gap(s), %.3fs missing, max %.3fs",
+                                    audioGaps, audioGapSeconds, audioMaxGapSeconds))
+            }
+            if audioNotReady > 0 { parts.append("\(audioNotReady) audio buffer(s) dropped — writer not ready") }
+            parts.append("video \(videoFrames) frames")
+            if videoNotReady > 0 { parts.append("\(videoNotReady) frame(s) dropped — writer not ready") }
+            if videoIncomplete > 0 { parts.append("\(videoIncomplete) incomplete frame(s)") }
+            return parts.joined(separator: ", ")
+        }
+    }
+
     /// Host-clock times (seconds) of the first written audio buffer / video
     /// frame — the zero points of the .m4a and .mp4 timelines. AudioMuxer uses
     /// them to align mic and system audio with the video.
@@ -272,6 +308,8 @@ class SystemAudioRecorder: NSObject {
         audioQueue = nil
         videoQueue = nil
 
+        let stats = statsLock.withLock { _stats }
+        log("[SystemAudioRecorder] Capture health — \(stats.summary)")
         log("[SystemAudioRecorder] Stopped")
     }
 }
@@ -282,7 +320,11 @@ extension SystemAudioRecorder: SCStreamOutput {
 
         switch type {
         case .audio:
-            guard let input = audioInput, input.isReadyForMoreMediaData else { return }
+            recordAudioTiming(sampleBuffer)
+            guard let input = audioInput, input.isReadyForMoreMediaData else {
+                statsLock.withLock { _stats.audioNotReady += 1 }
+                return
+            }
 
             if !audioSessionStarted {
                 let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -324,7 +366,10 @@ extension SystemAudioRecorder: SCStreamOutput {
                 log("[SystemAudioRecorder] Screen frame received — status: \(statusValue ?? -1), hasImageBuffer: \(CMSampleBufferGetImageBuffer(sampleBuffer) != nil)")
             }
 
-            guard status == .complete else { return }
+            guard status == .complete else {
+                statsLock.withLock { _stats.videoIncomplete += 1 }
+                return
+            }
 
             // Lazy init video writer on first real frame
             if videoWriter == nil {
@@ -334,7 +379,11 @@ extension SystemAudioRecorder: SCStreamOutput {
                 }
             }
 
-            guard let input = videoInput, input.isReadyForMoreMediaData else { return }
+            guard let input = videoInput, input.isReadyForMoreMediaData else {
+                statsLock.withLock { _stats.videoNotReady += 1 }
+                return
+            }
+            statsLock.withLock { _stats.videoFrames += 1 }
 
             if !videoSessionStarted {
                 let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -352,6 +401,35 @@ extension SystemAudioRecorder: SCStreamOutput {
 
         @unknown default:
             break
+        }
+    }
+
+    /// Count the buffer and the hole in front of it, if any.
+    ///
+    /// SCStream hands us presentation timestamps, so a missing stretch of
+    /// captured audio shows up as the next buffer starting later than the
+    /// previous one ended. Counted before the writer-readiness check, so a gap
+    /// on the capture side is never confused with our own writer falling behind.
+    private func recordAudioTiming(_ sampleBuffer: CMSampleBuffer) {
+        let start = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        let duration = CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer))
+        guard start.isFinite else { return }
+        statsLock.withLock {
+            _stats.audioBuffers += 1
+            if let expected = _stats.audioExpectedEnd {
+                // One buffer of slack: PTS jitter at buffer boundaries is
+                // normal, a real dropout is a multiple of the buffer length.
+                let gap = start - expected
+                if gap > max(duration, 0.005) {
+                    _stats.audioGaps += 1
+                    _stats.audioGapSeconds += gap
+                    _stats.audioMaxGapSeconds = max(_stats.audioMaxGapSeconds, gap)
+                }
+            }
+            // Always advance, even when the buffer reports no usable duration:
+            // leaving the cursor behind makes the NEXT buffer look like it
+            // arrived after a hole that spans this one too.
+            _stats.audioExpectedEnd = start + (duration.isFinite && duration > 0 ? duration : 0)
         }
     }
 

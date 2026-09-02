@@ -8,7 +8,7 @@ personal fork; do not push to any remote.
 ## Build / verify
 
 - `swift build` — the primary gate (repo root). ~10 s warm.
-- `swift test` — 124 tests; must stay offline and must never touch the real
+- `swift test` — 159 tests; must stay offline and must never touch the real
   data dir (fixture dirs only). ffmpeg/AEC-dependent tests skip themselves
   where those are not installed.
 - `bash bundle.sh` — builds MemorAI.app and codesigns it (stable identity so
@@ -50,10 +50,25 @@ per-day `index.jsonl` (one JSON record per screenshot; legacy per-shot
 Work files live in the same folder and are NOT recordings: `_mic.part<N>.m4a`
 / `.caf` (segments awaiting the stitcher), `_mic.stitching.m4a`,
 `_screen.muxing.mp4` (ffmpeg temporaries), `_session.json` (the post-processing
-manifest, present only while a session is unfinished). `_mic.aec.m4a` IS data —
+manifest, present only while a session is unfinished), `_track_<tag>_*.wav` /
+`_chunk_<tag>_*.wav` / `_whisper_<tag>_*.json` (the transcription's per-chunk
+cache; the JSONs outlive a pause on purpose and are swept when the transcript
+is written or the session is given up on). `_mic.aec.m4a` IS data —
 the echo-cancelled mic, kept next to the raw one.
 
 ## Call pipeline
+
+Where one recording ends: CallDetector polls which OTHER processes hold the
+mic. A free mic while system audio plays used to keep recording — Electron call
+apps release the mic on mute, and the far side is still worth having. That rule
+is now scoped to the app that was holding the mic (`kAudioProcessPropertyIs`
+`RunningOutput` on the same per-process API): the far side through Pachca keeps
+the session, Spotify after the meeting does not, and back-to-back calls land in
+separate files. Threshold `CallDetector.splitAfterCallAppQuiet` (180 s) is a
+starting point, NOT a measurement — every mic release and re-acquisition is
+logged with its duration so it can be set from real calls. Before this, one
+session ran 07:12–11:38 UTC on 2026-09-01: four meetings, five mic releases, one
+4.4-hour transcript.
 
 Recording: SystemAudioRecorder writes `_system.m4a` + `_screen.mp4`;
 MicRecorder writes `_mic.part<N>` segments (a new one on every engine restart —
@@ -65,6 +80,36 @@ Transcriber. Each stage is idempotent and recorded as it completes, so quitting
 or crashing mid-pipeline only costs the stage in flight; the next launch calls
 `resumeUnfinishedSessions()` and finishes the rest. Quit waits for the writers
 only — never for ffmpeg or whisper.
+
+Post-processing NEVER runs while a recording is in progress. The gate closes
+before the recorders start (`PostProcessor.setRecordingActive`), terminates the
+child process in flight, and reopens 15 s after the session stops; the deferred
+session is picked back up off its manifest. Whisper on the GPU plus the AEC
+sidecar on top of a live call is what made the speakers crackle mid-conversation
+(measured 2026-08-19: whisper 08:17:53–08:25:41 across a call recorded
+08:20:12–08:33:34). A stage cut short must NOT be recorded as done — an
+interrupted AEC otherwise passes for "declined" and the call keeps the raw mic
+forever, and an interrupted transcription for a finished transcript with a
+ten-minute hole in it. The gate is checked between stages AND inside the
+transcription's own chunk loop — killing the child in flight only frees the
+machine until the next chunk starts, and a long call is dozens of whisper runs
+(measured 2026-09-01: a 4.4 h call's transcription ran straight through the
+whole of the next call). Each chunk's whisper JSON stays on disk until the
+transcript is written, so a resumed run costs the interrupted chunk, not the
+hours before it; a chunk whisper fails on gets one retry, and a chunk lost
+after that is logged with the timestamps it covers rather than silently
+dropped. Post-processing children run through `ProcessRunner` with
+`role: .postProcessing` (utility QoS + nice 10, cancellable as a group);
+`.background` was measured at 2.6x slower and is not worth it now that the gate
+removes the overlap. Screen memory + OCR and dictation (its third audio engine
+and resident whisper-server) also stand down for the duration of a call.
+
+`AudioGlitchMonitor` is the instrument for all of this: it counts
+`kAudioDeviceProcessorOverload` on the default output/input while recording and
+stamps each event with the stage to blame, and it photographs (read-only, never
+sets) buffer frame size / sample rate around each recorder's start and stop.
+`tools/glitch-probe.sh` is the causal test — it SIGSTOPs the heavy children for
+a few seconds mid-crackle and resumes them.
 
 Invariants worth not breaking:
 - `call_<tag>_mic.m4a` appears only when it holds the WHOLE track. A failed
@@ -92,6 +137,17 @@ Invariants worth not breaking:
 - Subprocess calls must drain stdout/stderr concurrently (pipe-buffer
   deadlock; see Transcriber.runProcess) — reuse `runProcess`, don't add raw
   `waitUntilExit`-then-read code.
+- Every child has to be taken down on quit. `applicationShouldTerminate`
+  cancels the `.postProcessing` group and stops the OCR sidecar; without that
+  they outlive the app (seen 2026-09-01: an AEC and an OCR sidecar still
+  running after the app was gone). A new resident sidecar needs the same.
+- Nothing may claim a capture is kept before it is on disk. ClipboardMonitor
+  advances `lastChangeCount` only after the append succeeds, so a failed write
+  is retried on the next poll instead of skipped forever; the append throws
+  (and catches JSONSerialization's ObjC *raise*) rather than swallowing.
+- Durations come from the container header — `ffmpeg -i file` with no output.
+  `-f null -` decodes the whole track; on a 4-hour call it just burned the
+  timeout and then parsed the same header line anyway.
 - macOS TCC: Screen Recording / Microphone / Accessibility permissions are
   tied to the codesign identity; ad-hoc signing resets them on every rebuild —
   bundle.sh handles this, don't bypass it.

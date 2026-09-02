@@ -69,6 +69,36 @@ struct CallSessionManifest: Codable {
         self.tag = tag
     }
 
+    /// A manifest for a call whose own one is long gone — the recordings are on
+    /// disk and only the transcript is missing. Everything before transcription
+    /// is declared done, because the files it would have produced are already
+    /// there and redoing them would cost an hour to change nothing.
+    ///
+    /// Without the original there are no host-clock starts, so the two speakers
+    /// interleave from each track's own zero — off by however far apart the
+    /// recorders started, which is tenths of a second.
+    static func forRetranscribing(tag: String, mic: URL?, system: URL?, screen: URL?)
+        -> CallSessionManifest {
+        var manifest = CallSessionManifest(tag: tag)
+        manifest.micFile = mic?.lastPathComponent
+        // The echo-cancelled mic, when the original run produced one. Without
+        // this a retry transcribes the raw track while reusing chunks whisper
+        // made from the cleaned one — one transcript from two different mics.
+        if let mic = mic {
+            let cleaned = mic.deletingPathExtension()
+                .appendingPathExtension("aec").appendingPathExtension(mic.pathExtension)
+            if FileManager.default.fileExists(atPath: cleaned.path) {
+                manifest.cleanedMicFile = cleaned.lastPathComponent
+            }
+        }
+        manifest.systemFile = system?.lastPathComponent
+        manifest.screenFile = screen?.lastPathComponent
+        manifest.recordingFinished = true
+        manifest.stages = Stages(micPublished: true, echoCancelled: true,
+                                 muxed: true, transcribed: false)
+        return manifest
+    }
+
     // MARK: - Location
 
     static func url(forTag tag: String, in dir: URL) -> URL {

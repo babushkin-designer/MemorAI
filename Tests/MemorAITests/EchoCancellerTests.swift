@@ -10,6 +10,45 @@ final class EchoCancellerTests: XCTestCase {
                               erleDb: erle, voiceDeltaDb: voiceDelta, voiceCorrelation: correlation)
     }
 
+    private func metrics(erle: Double?, delayMs: Double, confidence: Double) -> EchoCanceller.Metrics {
+        EchoCanceller.Metrics(delaySamples: Int(delayMs * 16), delayMs: delayMs,
+                              delayConfidence: confidence, seconds: 90, farSeconds: 30,
+                              nearSeconds: 30, erleDb: erle, voiceDeltaDb: -0.1,
+                              voiceCorrelation: 0.99)
+    }
+
+    // MARK: - diagnosis
+
+    /// 2026-09-01, 12:12 call: lag found well inside the window, 2.4 dB removed,
+    /// output on the built-in speakers. Not a delay miss — open-air echo.
+    func testAConfidentLagWithLowErleBlamesTheSpeakers() {
+        let why = EchoCanceller.diagnosis(for: metrics(erle: 2.4, delayMs: 268, confidence: 0.31))
+        XCTAssertNotNil(why)
+        XCTAssertTrue(why!.contains("speakers"), why!)
+    }
+
+    /// 2026-08-18, 19:00 call: the true lag was 1422 ms, outside the ±1 s
+    /// search, and the sidecar returned 859 ms at confidence 0.0098.
+    func testAnUnlockedDelayPointsAtTheSearchWindow() {
+        let why = EchoCanceller.diagnosis(for: metrics(erle: 0.99, delayMs: 859, confidence: 0.0098))
+        XCTAssertNotNil(why)
+        XCTAssertTrue(why!.contains("search window"), why!)
+    }
+
+    /// A delay pinned against the edge is the same failure even when the
+    /// sidecar reports it confidently.
+    func testADelayPinnedToTheWindowEdgePointsAtTheWindowToo() {
+        let why = EchoCanceller.diagnosis(for: metrics(erle: 1.0, delayMs: -985, confidence: 0.4))
+        XCTAssertTrue(why?.contains("search window") ?? false, why ?? "nil")
+    }
+
+    /// With no far-end audio there is no ERLE and nothing to explain. Note the
+    /// function does NOT re-check the acceptance threshold: only the verdict
+    /// decides that, and the one caller asks after it has already rejected.
+    func testNoErleMeansNothingToExplain() {
+        XCTAssertNil(EchoCanceller.diagnosis(for: metrics(erle: nil, delayMs: 268, confidence: 0.31)))
+    }
+
     // MARK: - verdict
 
     func testRealMeasuredResultIsAccepted() {

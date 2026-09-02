@@ -55,6 +55,13 @@ class EchoCanceller {
     /// Enough near/far speech to trust a measurement at all.
     static let minJudgeableSeconds: Double = 1.0
 
+    /// `aec_sidecar.py`'s `MAX_DELAY_SECONDS`, in ms. A delay pinned against
+    /// this edge means the true lag is past it, not that it was found there.
+    static let delaySearchWindowMs: Double = 1000
+    /// Below this the sidecar did not lock onto anything (0.0098 on the
+    /// 2026-08-18 call whose real lag was 1422 ms; 0.31–0.34 when it locks).
+    static let weakDelayConfidence: Double = 0.05
+
     private let queue = DispatchQueue(label: "com.local.memorai.aec", qos: .utility)
 
     private let ffmpegPath: String = {
@@ -104,6 +111,27 @@ class EchoCanceller {
         }
         return (true, String(format: "%.1f dB echo removed, voice %+.2f dB",
                              erle, m.voiceDeltaDb ?? 0))
+    }
+
+    /// Why a weak result is weak. Two unrelated failures produce the same
+    /// small ERLE and have opposite fixes, and the number alone has sent this
+    /// investigation the wrong way before.
+    ///
+    /// Either the sidecar never found the lag — it searches ±1 s and a real
+    /// call has run 1422 ms out — or it found it and the echo still would not
+    /// cancel, which is what recording through open speakers does to a linear
+    /// canceller. Nil when the result was good enough to use.
+    /// Only called for a result `verdict` already rejected — it does not
+    /// re-derive that rule, which picks between two ERLE thresholds and would
+    /// be a second copy to keep in step.
+    static func diagnosis(for m: Metrics) -> String? {
+        guard m.erleDb != nil else { return nil }
+        if m.delayConfidence < weakDelayConfidence || abs(m.delayMs) >= delaySearchWindowMs - 50 {
+            return String(format: "lag %+.0f ms at confidence %.3f — that is the edge of the ±1 s search window, so measure the true offset before trusting this number",
+                          m.delayMs, m.delayConfidence)
+        }
+        return String(format: "lag %+.0f ms found at confidence %.2f, so the echo is real and simply will not cancel — open speakers rather than headphones do that, and the mic track keeps a copy of the far side that doubles it in the transcript",
+                      m.delayMs, m.delayConfidence)
     }
 
     /// ffmpeg args to decode any of our call tracks into what the model wants.
@@ -158,7 +186,7 @@ class EchoCanceller {
             let result = ProcessRunner.run(ffmpegPath,
                                            args: Self.buildDecodeArgs(inputPath: source.path,
                                                                       outPath: target.path),
-                                           timeout: 300)
+                                           timeout: 300, role: .postProcessing)
             guard result.exitCode == 0 else {
                 log("[EchoCanceller] ❌ Decoding \(source.lastPathComponent) failed: \(result.stderrTail)")
                 return nil
@@ -172,7 +200,7 @@ class EchoCanceller {
                                                                 lpbWav: lpbWav.path,
                                                                 outWav: cleanWav.path,
                                                                 modelPrefix: Self.modelPrefix),
-                                    timeout: 3600)
+                                    timeout: 3600, role: .postProcessing)
         guard run.exitCode == 0, let metrics = Self.parseMetrics(run.stdout) else {
             log("[EchoCanceller] ❌ Sidecar failed (exit \(run.exitCode)): \(run.stderrTail)")
             return nil
@@ -181,6 +209,9 @@ class EchoCanceller {
         let verdict = Self.verdict(for: metrics)
         log(String(format: "[EchoCanceller] delay %+.0f ms, %@ — %@",
                    metrics.delayMs, verdict.reason, verdict.accept ? "using cleaned mic" : "keeping raw mic"))
+        if !verdict.accept, let why = Self.diagnosis(for: metrics) {
+            log("[EchoCanceller] \(why)")
+        }
         guard verdict.accept else { return nil }
 
         let cleanURL = micURL.deletingPathExtension()
@@ -189,7 +220,7 @@ class EchoCanceller {
         let encode = ProcessRunner.run(ffmpegPath,
                                        args: Self.buildEncodeArgs(inputPath: cleanWav.path,
                                                                   outPath: cleanURL.path),
-                                       timeout: 600)
+                                       timeout: 600, role: .postProcessing)
         guard encode.exitCode == 0 else {
             log("[EchoCanceller] ❌ Encoding cleaned mic failed: \(encode.stderrTail)")
             try? fm.removeItem(at: cleanURL)

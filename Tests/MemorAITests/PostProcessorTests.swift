@@ -195,6 +195,97 @@ final class PostProcessorTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: live.path))
     }
 
+    // MARK: - The recording gate
+
+    /// The bug this closes: post-processing a previous call ran straight
+    /// through the next call's recording (measured 2026-08-19), and whisper
+    /// plus the AEC sidecar on the same machine is what makes the speakers
+    /// crackle mid-conversation.
+    func testNothingRunsWhileARecordingIsInProgress() throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tag = "2026-01-01_00-00-00"
+        var manifest = CallSessionManifest(tag: tag)
+        manifest.micFile = "call_\(tag)_mic.m4a"
+        manifest.save(in: dir)
+
+        let processor = PostProcessor(transcription: false)
+        processor.setRecordingActive(true, dir: dir)
+        processor.enqueue(manifest, in: dir)
+        processor.waitUntilIdle()
+
+        // Still pending, and the deferral did not cost the session a retry —
+        // otherwise a run of interrupted attempts would exhaust maxAttempts and
+        // the call would be given up on without ever having been processed.
+        let pending = CallSessionManifest.pending(in: dir)
+        XCTAssertEqual(pending.count, 1)
+        let onDisk = try XCTUnwrap(CallSessionManifest.load(pending[0]))
+        XCTAssertEqual(onDisk.attempts, 0)
+        XCTAssertFalse(onDisk.stages.micPublished)
+    }
+
+    /// And once the call is over the same manifest is picked back up off disk.
+    func testWorkResumesAfterTheRecordingEnds() throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tag = "2026-01-01_00-00-00"
+        var manifest = CallSessionManifest(tag: tag)
+        manifest.micFile = "call_\(tag)_mic.m4a"
+        manifest.save(in: dir)
+
+        let processor = PostProcessor(transcription: false)
+        processor.gateReopenDelay = 0.1
+        processor.setRecordingActive(true, dir: dir)
+        processor.enqueue(manifest, in: dir)
+        processor.waitUntilIdle()
+        XCTAssertEqual(CallSessionManifest.pending(in: dir).count, 1)
+
+        processor.setRecordingActive(false, dir: dir)
+        // The gate schedules the resume; nothing here may run before it fires.
+        let resumed = expectation(description: "session picked back up")
+        DispatchQueue.global().async {
+            while CallSessionManifest.pending(in: dir).count == 1 { usleep(50_000) }
+            resumed.fulfill()
+        }
+        wait(for: [resumed], timeout: 60)
+    }
+
+    /// "Transcribe Now" on a call whose manifest is long gone: the stand-in
+    /// must not send an hour-old recording back through echo cancellation and
+    /// muxing to produce files that are already sitting next to it.
+    func testAStandInManifestOnlyAsksForTheTranscript() {
+        let m = CallSessionManifest.forRetranscribing(
+            tag: "2026-01-01_00-00-00",
+            mic: URL(fileURLWithPath: "/tmp/call_2026-01-01_00-00-00_mic.m4a"),
+            system: URL(fileURLWithPath: "/tmp/call_2026-01-01_00-00-00_system.m4a"),
+            screen: nil)
+
+        XCTAssertTrue(m.stages.micPublished)
+        XCTAssertTrue(m.stages.echoCancelled)
+        XCTAssertTrue(m.stages.muxed)
+        XCTAssertFalse(m.stages.transcribed)
+        XCTAssertFalse(m.stages.allDone)
+        XCTAssertTrue(m.recordingFinished, "the recorders finished long ago")
+        XCTAssertEqual(m.micFile, "call_2026-01-01_00-00-00_mic.m4a")
+        XCTAssertNil(m.screenFile)
+    }
+
+    /// It round-trips like any other, so a request made during a call survives
+    /// on disk until the gate opens.
+    func testAStandInManifestSurvivesOnDisk() throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let m = CallSessionManifest.forRetranscribing(
+            tag: "2026-01-01_00-00-00", mic: nil,
+            system: URL(fileURLWithPath: "/tmp/call_2026-01-01_00-00-00_system.m4a"), screen: nil)
+        m.save(in: dir)
+
+        let loaded = try XCTUnwrap(CallSessionManifest.load(m.url(in: dir)))
+        XCTAssertEqual(loaded.stages.transcribed, false)
+        XCTAssertEqual(loaded.stages.muxed, true)
+        XCTAssertEqual(loaded.systemFile, "call_2026-01-01_00-00-00_system.m4a")
+    }
+
     // MARK: - helpers
 
     private func makeDir() throws -> URL {

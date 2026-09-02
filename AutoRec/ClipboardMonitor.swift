@@ -10,7 +10,22 @@ struct ClipboardEntry {
 }
 
 class ClipboardMonitor {
+    /// Only ever advanced once the entry it stands for is on disk — or once we
+    /// have decided on purpose not to keep it. Advancing it first, as this used
+    /// to, turned a failed append into a copy that never existed.
     private var lastChangeCount: Int = 0
+    /// Entries built but not yet on disk. A failed append used to leave the
+    /// change count where it was, which retried at the poll rate — twice a
+    /// second, rebuilding the record each time, re-encoding a copied image and
+    /// rewriting it before even attempting the append. They are held here
+    /// instead and flushed on a slow timer, so a full disk costs one attempt
+    /// every half minute and the copies survive until it clears.
+    private var pending: [[String: Any]] = []
+    private var retryAfter: Date?
+    private let retryInterval: TimeInterval = 30
+    /// Bounded: this is a fallback for a disk that is not writing, not a queue.
+    private let maxPending = 200
+    private var reportedFailure = false
     private var storageURL: URL?
     private let pasteboard = NSPasteboard.general
 
@@ -27,9 +42,11 @@ class ClipboardMonitor {
     /// Called periodically. Checks if clipboard changed and saves if so.
     func checkAndSave(excludedBundleIds: [String]) {
         guard let storage = storageURL else { return }
+        let logURL = storage.appendingPathComponent("clipboard.jsonl")
+        flushPending(to: logURL)
+
         let current = pasteboard.changeCount
         guard current != lastChangeCount else { return }
-        lastChangeCount = current
 
         // Honor the de-facto standard privacy markers set by password managers
         // and clipboard tools: never persist concealed or transient contents.
@@ -40,6 +57,7 @@ class ClipboardMonitor {
         ]
         if let types = pasteboard.types, privacyMarkers.contains(where: types.contains) {
             log("[Clipboard] Skipped concealed/transient clipboard entry")
+            lastChangeCount = current
             return
         }
 
@@ -47,6 +65,7 @@ class ClipboardMonitor {
         let frontApp = NSWorkspace.shared.frontmostApplication
         if let bundleId = frontApp?.bundleIdentifier,
            excludedBundleIds.contains(bundleId) {
+            lastChangeCount = current
             return
         }
 
@@ -98,30 +117,59 @@ class ClipboardMonitor {
         entry["type"] = type
         entry["content"] = content
 
-        // Add to in-memory buffer
+        // The change count says "this copy is kept". It may only move once the
+        // entry is on disk, or at least safely queued for it — advancing first
+        // turned a failed write into a copy that never existed.
+        if !pending.isEmpty {
+            hold(entry)
+        } else {
+            do {
+                try JSONLWriter.appendNow(entry, to: logURL)
+                reportedFailure = false
+            } catch {
+                if !reportedFailure {
+                    reportedFailure = true
+                    log("[Clipboard] ❌ Could not append to clipboard.jsonl: \(error.localizedDescription) — holding entries and retrying every \(Int(retryInterval))s")
+                }
+                hold(entry)
+                retryAfter = Date().addingTimeInterval(retryInterval)
+            }
+        }
+        lastChangeCount = current
+
         let clipEntry = ClipboardEntry(timestamp: now, appName: appName, bundleId: bundleId, type: type, content: content)
         recentEntries.insert(clipEntry, at: 0)
         if recentEntries.count > maxEntries {
             recentEntries.removeLast()
         }
+    }
 
-        // Append to clipboard.jsonl
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]),
-              var line = String(data: jsonData, encoding: .utf8) else { return }
-        line += "\n"
 
-        let logURL = storage.appendingPathComponent("clipboard.jsonl")
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: logURL.path) {
-                if let fh = try? FileHandle(forWritingTo: logURL) {
-                    fh.seekToEndOfFile()
-                    fh.write(data)
-                    fh.closeFile()
-                }
-            } else {
-                try? data.write(to: logURL)
+    private func hold(_ entry: [String: Any]) {
+        pending.append(entry)
+        if pending.count > maxPending {
+            pending.removeFirst()
+            log("[Clipboard] ⚠️ Held entries exceeded \(maxPending) — dropped the oldest")
+        }
+    }
+
+    /// Retry the held entries, oldest first, no more than once per
+    /// `retryInterval`. Stops at the first failure so the order is kept.
+    private func flushPending(to logURL: URL) {
+        guard !pending.isEmpty else { return }
+        if let after = retryAfter, Date() < after { return }
+        while let entry = pending.first {
+            do {
+                try JSONLWriter.appendNow(entry, to: logURL)
+                pending.removeFirst()
+            } catch {
+                retryAfter = Date().addingTimeInterval(retryInterval)
+                return
             }
         }
+        retryAfter = nil
+        reportedFailure = false
+        log("[Clipboard] Held entries written")
     }
 
     /// Load recent entries from clipboard.jsonl

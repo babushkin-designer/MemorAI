@@ -20,7 +20,15 @@ class OCRProcessor {
         "/usr/local/bin/python3",     // Intel Homebrew
     ]
 
-    private var sidecar: Process?
+    /// Guarded by `shutdownLock` rather than by `queue`, because `queue` can be
+    /// sitting inside a 30 s read and quit may not wait that long for it. An
+    /// uncontended lock costs nothing next to what it guards against.
+    private let shutdownLock = NSLock()
+    private var sidecar: Process? {
+        get { shutdownLock.withLock { _sidecar } }
+        set { shutdownLock.withLock { _sidecar = newValue } }
+    }
+    private var _sidecar: Process?
     private var sidecarIn: FileHandle?
     private var sidecarOut: FileHandle?
     private var outBuffer = Data()
@@ -140,9 +148,25 @@ class OCRProcessor {
         }
     }
 
+    /// Stop the resident sidecar. Nothing did this on quit, so the Python
+    /// process outlived the app that spawned it and kept a core busy (seen
+    /// 2026-09-01, alongside an orphaned AEC sidecar).
+    ///
+    /// Deliberately does NOT go through `queue`: a request in flight holds it
+    /// for up to 30 s, and quit is not allowed to wait that long. Terminating
+    /// the process out from under that read just ends it early, which is what
+    /// we want anyway.
+    func shutdown() {
+        let proc = shutdownLock.withLock { () -> Process? in
+            let running = _sidecar
+            _sidecar = nil
+            return running
+        }
+        proc?.terminate()
+    }
+
     private func teardownSidecar() {
-        sidecar?.terminate()
-        sidecar = nil
+        shutdown()
         sidecarIn = nil
         sidecarOut = nil
         outBuffer.removeAll()

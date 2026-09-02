@@ -14,6 +14,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         screenMemory.stop()
         dictation?.shutdown()
+        // whisper, ffmpeg and the AEC sidecar are ours; without this they
+        // outlive the app and keep working for a parent that is gone. Suspend
+        // rather than cancel: killing the child in flight leaves the pipeline
+        // free to spawn the next one in the moments before the process
+        // actually exits, which orphans it just the same. Every stage they
+        // were in is recorded in the manifest and resumed at the next launch.
+        ProcessRunner.suspendPostProcessing(reason: "quitting")
         let state = recordingManager?.state ?? .idle
         guard state == .recording || state == .starting || state == .paused || state == .stopping else {
             return .terminateNow
@@ -65,6 +72,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 if self.settings.autoDetect { self.callDetector.exitRecordingMode() }
             }
+            // Everything else this app does that costs real CPU stands down for
+            // the duration of a call: the screenshot loop with its OCR sidecar,
+            // and dictation with its resident whisper model.
+            self.screenMemory?.setCallActive(active)
+            self.dictation?.setCallActive(active)
         }
         recordingManager.onSilenceChanged = { [weak self] silent in
             self?.callDetector.reportSystemAudioSilence(silent)
@@ -434,8 +446,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if let url = session.transcriptURL {
                 addOpenItem(sub, "📝 Transcript", url)
+            } else if session.hasAudio {
+                // A call can sit without a transcript for reasons the app
+                // cannot fix by itself — whisper was missing, the model was
+                // not installed, the session ran out of automatic attempts.
+                // Asking again should not require going through the files.
+                let retry = NSMenuItem(title: "📝 Transcribe Now",
+                                       action: #selector(transcribeCall(_:)), keyEquivalent: "")
+                retry.target = self
+                retry.representedObject = session.tag
+                sub.addItem(retry)
             } else {
-                let pending = NSMenuItem(title: "📝 Transcript (pending…)", action: nil, keyEquivalent: "")
+                let pending = NSMenuItem(title: "📝 Transcript (no audio)", action: nil, keyEquivalent: "")
                 pending.isEnabled = false
                 sub.addItem(pending)
             }
@@ -464,6 +486,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             sub.addItem(.separator())
+            if let url = session.transcriptURL {
+                let copyPath = NSMenuItem(title: "📋 Copy Transcript Path",
+                                          action: #selector(copyPathToClipboard(_:)), keyEquivalent: "")
+                copyPath.target = self
+                copyPath.representedObject = url
+                sub.addItem(copyPath)
+            }
             let reveal = NSMenuItem(title: "Show in Finder", action: #selector(revealCallInFinder(_:)), keyEquivalent: "")
             reveal.target = self
             reveal.representedObject = session.videoURL ?? session.transcriptURL ?? session.micURL ?? session.systemURL
@@ -496,6 +525,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openFileURL(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    /// Put a call back through transcription. Its own manifest is preferred
+    /// when it still exists — it carries the host-clock starts that put both
+    /// speakers on one timeline — and a stand-in is built from the files on
+    /// disk when it does not. Either way the recording gate still applies: a
+    /// request made during a call waits for the call to end.
+    @objc private func transcribeCall(_ sender: NSMenuItem) {
+        guard let tag = sender.representedObject as? String,
+              let session = sessionForTag(tag) else { return }
+        let dir = URL(fileURLWithPath: settings.outputPath)
+
+        var manifest: CallSessionManifest
+        if let existing = CallSessionManifest.load(CallSessionManifest.url(forTag: tag, in: dir)) {
+            manifest = existing
+            manifest.attempts = 0
+        } else {
+            manifest = .forRetranscribing(tag: tag, mic: session.micURL,
+                                          system: session.systemURL, screen: session.videoURL)
+        }
+        manifest.stages.transcribed = false
+        log("[Menu] Transcription requested for \(tag)")
+        PostProcessor.shared.enqueue(manifest, in: dir)
+    }
+
+    /// The plain POSIX path, which is what gets pasted into a chat. Writing a
+    /// file URL alongside it would make some apps paste the file itself.
+    @objc private func copyPathToClipboard(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.path, forType: .string)
+        log("[Menu] Copied path to clipboard: \(url.lastPathComponent)")
     }
 
     // MARK: - LLM actions (summary / follow-up)
