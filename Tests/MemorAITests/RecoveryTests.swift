@@ -15,7 +15,7 @@ final class RecoveryTests: XCTestCase {
             "call_2026-01-02_00-00-00_mic.part1.m4a",   // another call
             "memorai.log",
         ]
-        XCTAssertEqual(PostProcessor.orphanMicParts(names: names, tag: "2026-01-01_00-00-00"), [
+        XCTAssertEqual(CallMediaService.orphanMicParts(names: names, tag: "2026-01-01_00-00-00"), [
             "call_2026-01-01_00-00-00_mic.part1.m4a",
             "call_2026-01-01_00-00-00_mic.part2.caf",
             "call_2026-01-01_00-00-00_mic.part10.m4a",
@@ -24,7 +24,7 @@ final class RecoveryTests: XCTestCase {
 
     func testOrphanScanIgnoresNamesItCannotOrder() {
         let names = ["call_t_mic.partX.m4a", "call_t_mic.part.m4a", "call_t_mic.part3.m4a"]
-        XCTAssertEqual(PostProcessor.orphanMicParts(names: names, tag: "t"), ["call_t_mic.part3.m4a"])
+        XCTAssertEqual(CallMediaService.orphanMicParts(names: names, tag: "t"), ["call_t_mic.part3.m4a"])
     }
 
     func testRecoveredSegmentHasUnknownLengthButIsNotEmpty() {

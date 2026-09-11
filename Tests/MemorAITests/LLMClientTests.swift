@@ -4,10 +4,11 @@ import XCTest
 final class LLMClientTests: XCTestCase {
 
     func testParseContentExtractsTextAndUsage() throws {
-        let json = """
+        let jsonString = """
         {"choices":[{"message":{"role":"assistant","content":"Привет"}}],
          "usage":{"prompt_tokens":12,"completion_tokens":3}}
-        """.data(using: .utf8)!
+        """
+        let json = Data(jsonString.utf8)
         let parsed = try XCTUnwrap(LLMClient.parseContent(json))
         XCTAssertEqual(parsed.text, "Привет")
         XCTAssertEqual(parsed.tokensIn, 12)

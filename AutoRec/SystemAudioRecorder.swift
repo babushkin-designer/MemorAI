@@ -276,14 +276,11 @@ class SystemAudioRecorder: NSObject {
         if let aInput = audioInput, let aWriter = audioWriter {
             if aWriter.status == .writing {
                 aInput.markAsFinished()
-                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                    aWriter.finishWriting {
-                        log("[SystemAudioRecorder] Audio done — status: \(aWriter.status.rawValue)")
-                        cont.resume()
-                    }
-                }
+                await aWriter.finishWriting()
+                log("[SystemAudioRecorder] Audio done — status: \(aWriter.status.rawValue)")
             } else {
-                log("[SystemAudioRecorder] Audio writer not in writing state: \(aWriter.status.rawValue), error: \(aWriter.error?.localizedDescription ?? "none")")
+                let error = aWriter.error?.localizedDescription ?? "none"
+                log("[SystemAudioRecorder] Audio writer not in writing state: \(aWriter.status.rawValue), error: \(error)")
             }
         }
         audioWriter = nil
@@ -293,14 +290,11 @@ class SystemAudioRecorder: NSObject {
         if let vInput = videoInput, let vWriter = videoWriter {
             if vWriter.status == .writing {
                 vInput.markAsFinished()
-                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                    vWriter.finishWriting {
-                        log("[SystemAudioRecorder] Video done — status: \(vWriter.status.rawValue)")
-                        cont.resume()
-                    }
-                }
+                await vWriter.finishWriting()
+                log("[SystemAudioRecorder] Video done — status: \(vWriter.status.rawValue)")
             } else {
-                log("[SystemAudioRecorder] ❌ Video writer not in writing state: \(vWriter.status.rawValue), error: \(vWriter.error?.localizedDescription ?? "none")")
+                let error = vWriter.error?.localizedDescription ?? "none"
+                log("[SystemAudioRecorder] ❌ Video writer not in writing state: \(vWriter.status.rawValue), error: \(error)")
             }
         }
         videoWriter = nil
@@ -333,7 +327,9 @@ extension SystemAudioRecorder: SCStreamOutput {
                 audioFirstPTSSeconds = CMTimeGetSeconds(pts)
                 if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
                    let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
-                    log("[SystemAudioRecorder] Audio format: \(asbd.pointee.mSampleRate)Hz, \(asbd.pointee.mChannelsPerFrame)ch, \(asbd.pointee.mBitsPerChannel)bit")
+                    let format = asbd.pointee
+                    log("[SystemAudioRecorder] Audio format: \(format.mSampleRate)Hz,"
+                        + " \(format.mChannelsPerFrame)ch, \(format.mBitsPerChannel)bit")
                 }
             }
             input.append(sampleBuffer)
@@ -363,7 +359,9 @@ extension SystemAudioRecorder: SCStreamOutput {
             let status = statusValue.flatMap { SCFrameStatus(rawValue: $0) }
 
             if !videoSessionStarted {
-                log("[SystemAudioRecorder] Screen frame received — status: \(statusValue ?? -1), hasImageBuffer: \(CMSampleBufferGetImageBuffer(sampleBuffer) != nil)")
+                let hasImageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) != nil
+                log("[SystemAudioRecorder] Screen frame received — status: \(statusValue ?? -1),"
+                    + " hasImageBuffer: \(hasImageBuffer)")
             }
 
             guard status == .complete else {
@@ -395,7 +393,11 @@ extension SystemAudioRecorder: SCStreamOutput {
 
             if !input.append(sampleBuffer) {
                 let err = videoWriter?.error
-                log("[SystemAudioRecorder] ❌ Video append failed — writer status: \(videoWriter?.status.rawValue ?? -1), error: \(err?.localizedDescription ?? "unknown"), underlying: \((err as NSError?)?.userInfo ?? [:])")
+                let status = videoWriter?.status.rawValue ?? -1
+                let message = err?.localizedDescription ?? "unknown"
+                let underlying = (err as NSError?)?.userInfo ?? [:]
+                log("[SystemAudioRecorder] ❌ Video append failed — writer status: \(status),"
+                    + " error: \(message), underlying: \(underlying)")
                 videoFailed = true
             }
 

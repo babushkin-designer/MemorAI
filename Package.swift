@@ -15,6 +15,10 @@ let package = Package(
             name: "MemorAI",
             dependencies: ["ObjCTry"],
             path: "AutoRec",
+            exclude: [
+                "aec_sidecar.py",
+                "ocr_sidecar.py",
+            ],
             linkerSettings: [
                 .linkedFramework("Cocoa"),
                 .linkedFramework("AVFoundation"),

@@ -1,8 +1,9 @@
 import Foundation
 
 /// Everything that happens to a call after the recorders have stopped:
-/// publish the mic track, cancel the echo in it, mux the audio into the video,
-/// transcribe. Minutes of work on a long call.
+/// publish the mic track, transcribe it, then optionally clean the recording
+/// and mux its audio into the video. The user-facing transcript goes first;
+/// playback enhancements must never hold it hostage.
 ///
 /// It is driven off a manifest on disk rather than off in-memory state, so the
 /// pipeline survives the app going away in the middle. Quitting no longer has
@@ -18,12 +19,15 @@ final class PostProcessor {
     /// order.
     private let queue = DispatchQueue(label: "com.local.memorai.postprocess", qos: .utility)
 
-    /// Off in the test suite: transcription needs whisper, its model, and
-    /// minutes of CPU, none of which belong in `swift test`.
-    private let transcriptionEnabled: Bool
+    private let transcriptionService: CallTranscriptionService
+    private let mediaService: CallMediaService
 
-    init(transcription: Bool = true) {
-        self.transcriptionEnabled = transcription
+    init(transcription: Bool = true,
+         transcriptionService: CallTranscriptionService? = nil,
+         mediaService: CallMediaService = .shared) {
+        self.transcriptionService = transcriptionService
+            ?? (transcription ? .shared : CallTranscriptionService(enabled: false))
+        self.mediaService = mediaService
     }
 
     /// Blocks until everything queued so far has run.
@@ -36,6 +40,12 @@ final class PostProcessor {
     /// sitting inside a whisper run for minutes.
     private let gateLock = NSLock()
     private var _recordingActive = false
+
+    /// Accessed only on `queue`. Retryable cloud/local failures are retried in
+    /// the running app instead of waiting for its next launch.
+    private var retryableTranscriptionTags: Set<String> = []
+    private var scheduledRetries: Set<String> = []
+    var transcriptionRetryDelay: TimeInterval = 30
 
     private var isRecordingActive: Bool { gateLock.withLock { _recordingActive } }
 
@@ -77,19 +87,27 @@ final class PostProcessor {
     /// `var` so the tests do not have to wait it out.
     var gateReopenDelay: TimeInterval = 15
 
-    /// True while a transcription is running (drives the menu bar label).
-    private(set) var isTranscribing = false
-    var onTranscribingChanged: ((Bool) -> Void)?
-    var onTranscriptionDone: (() -> Void)?
-
     /// Work files that a killed run can leave behind. Each is rebuilt from
     /// scratch by the stage that owns it, so a leftover is always garbage.
     static let temporarySuffixes = [".stitching.m4a", ".muxing.mp4"]
 
     /// Runs the pipeline for one session. Returns immediately.
-    func enqueue(_ manifest: CallSessionManifest, in dir: URL) {
+    func enqueue(_ manifest: CallSessionManifest, in dir: URL,
+                 resetTranscription: Bool = false) {
+        // Queue identity, not a frozen manifest value. A manual request can be
+        // made while an earlier run is still saving stages; applying its reset
+        // on this serial queue avoids clobbering that newer progress.
+        let url = manifest.url(in: dir)
+        if !FileManager.default.fileExists(atPath: url.path) { manifest.save(in: dir) }
         queue.async { [weak self] in
-            self?.run(manifest: manifest, in: dir)
+            guard let self else { return }
+            if resetTranscription {
+                guard var latest = CallSessionManifest.load(url) else { return }
+                latest.attempts = 0
+                latest.stages.transcribed = false
+                latest.save(in: dir)
+            }
+            self.processBatch([url], in: dir)
         }
     }
 
@@ -102,14 +120,15 @@ final class PostProcessor {
             self.removeOrphanedWorkFiles(in: dir, keepingSessionsFor: pending)
             guard !pending.isEmpty else { return }
             log("[PostProcessor] \(pending.count) unfinished session(s) from a previous run — resuming")
-            for url in pending {
-                guard let manifest = CallSessionManifest.load(url) else {
+            let readable = pending.filter { url in
+                guard CallSessionManifest.load(url) != nil else {
                     log("[PostProcessor] ⚠️ Unreadable manifest \(url.lastPathComponent) — removing")
                     try? FileManager.default.removeItem(at: url)
-                    continue
+                    return false
                 }
-                self.run(manifest: manifest, in: dir)
+                return true
             }
+            self.processBatch(readable, in: dir)
         }
     }
 
@@ -133,26 +152,46 @@ final class PostProcessor {
 
     // MARK: - The pipeline
 
-    private func run(manifest input: CallSessionManifest, in dir: URL) {
+    private enum Phase {
+        case transcription
+        case media
+    }
+
+    /// Every pending call gets its transcript pass before any call enters the
+    /// slower playback-only AEC/mux pass. This prevents one old recording from
+    /// holding the rest of a recovered backlog behind hours of enhancement.
+    private func processBatch(_ urls: [URL], in dir: URL) {
+        let transcriptSteps: [(String, (inout CallSessionManifest, URL) -> Void)] = [
+            ("stitch", mediaService.publishMicTrack),
+            ("transcribe", transcribe),
+        ]
+        let mediaSteps: [(String, (inout CallSessionManifest, URL) -> Void)] = [
+            ("aec", mediaService.cancelEcho),
+            ("mux", mediaService.muxVideo),
+        ]
+
+        for url in urls {
+            guard let manifest = CallSessionManifest.load(url) else { continue }
+            run(manifest: manifest, in: dir, steps: transcriptSteps, phase: .transcription)
+        }
+        for url in urls {
+            guard let manifest = CallSessionManifest.load(url) else { continue }
+            run(manifest: manifest, in: dir, steps: mediaSteps, phase: .media)
+        }
+    }
+
+    private func run(manifest input: CallSessionManifest, in dir: URL,
+                     steps: [(String, (inout CallSessionManifest, URL) -> Void)],
+                     phase: Phase) {
         guard !isRecordingActive else {
             log("[PostProcessor] Recording in progress — \(input.tag) waits (manifest stays on disk)")
             return
         }
 
         var manifest = input
-        manifest.attempts += 1
+        if case .transcription = phase { manifest.attempts += 1 }
         let attempt = manifest.attempts
         manifest.save(in: dir)
-
-        // Name the stage while it runs: these are the heaviest things the app
-        // does, and when one of them lands on top of a live call the glitch
-        // monitor's overload lines say so by name.
-        let steps: [(String, (inout CallSessionManifest, URL) -> Void)] = [
-            ("stitch", publishMicTrack),
-            ("aec", cancelEcho),
-            ("mux", muxVideo),
-            ("whisper", transcribe),
-        ]
         // Stages that finished on their own merits. A stage cut short by a
         // recording must not be recorded as done — an interrupted AEC otherwise
         // passes for "echo cancellation declined" and the call keeps the raw
@@ -165,13 +204,21 @@ final class PostProcessor {
             if isRecordingActive { interrupted = true; break }
             AudioGlitchMonitor.shared.setStage("\(name) \(manifest.tag)")
             step(&manifest, dir)
-            if ProcessRunner.consumeCancellation() || isRecordingActive {
+            let cancelled = ProcessRunner.consumeCancellation()
+            if cancelled {
                 manifest.stages = completed
                 interrupted = true
                 log("[PostProcessor] Stage \(name) for \(manifest.tag) cut short by a recording")
                 break
             }
             completed = manifest.stages
+            if isRecordingActive {
+                // A network-only Deepgram upload already in flight is allowed
+                // to finish. Preserve it, then stop before local heavy work.
+                interrupted = true
+                log("[PostProcessor] Recording began after \(name) for \(manifest.tag) completed")
+                break
+            }
         }
         AudioGlitchMonitor.shared.setStage(nil)
 
@@ -184,169 +231,59 @@ final class PostProcessor {
             return
         }
 
+        guard case .media = phase else {
+            manifest.save(in: dir)
+            return
+        }
+
         if manifest.stages.allDone {
+            retryableTranscriptionTags.remove(manifest.tag)
             manifest.remove(in: dir)
             log("[PostProcessor] Session \(manifest.tag) complete")
         } else if attempt >= CallSessionManifest.maxAttempts {
+            retryableTranscriptionTags.remove(manifest.tag)
             manifest.remove(in: dir)
             Transcriber.discardPartials(tag: manifest.tag, in: dir)
             log("[PostProcessor] ⚠️ Session \(manifest.tag) still unfinished after \(attempt) attempts — giving up (stages: \(manifest.stages))")
         } else {
             manifest.save(in: dir)
-            log("[PostProcessor] Session \(manifest.tag) partially processed — will retry at next launch")
-        }
-    }
-
-    /// Mic part files belonging to `tag`, in recording order. `part10` must
-    /// come after `part2`, so the index is compared as a number.
-    static func orphanMicParts(names: [String], tag: String) -> [String] {
-        let prefix = "call_\(tag)_mic.part"
-        return names
-            .compactMap { name -> (Int, String)? in
-                guard name.hasPrefix(prefix) else { return nil }
-                let rest = name.dropFirst(prefix.count)               // "2.caf"
-                guard let dot = rest.firstIndex(of: "."),
-                      let index = Int(rest[..<dot]) else { return nil }
-                return (index, name)
+            if retryableTranscriptionTags.contains(manifest.tag) {
+                scheduleRetry(for: manifest, in: dir)
+                log("[PostProcessor] Session \(manifest.tag) partially processed — retry scheduled")
+            } else {
+                log("[PostProcessor] Session \(manifest.tag) partially processed — will retry at next launch")
             }
-            .sorted { $0.0 < $1.0 }
-            .map { $0.1 }
-    }
-
-    /// A session killed mid-recording never wrote its segment list. The part
-    /// files are still there, so hand them to the stitcher and let ffmpeg say
-    /// whether anything is salvageable — an m4a killed before its moov atom
-    /// was written usually is not, but the LPCM parts are.
-    private func adoptOrphanParts(_ manifest: inout CallSessionManifest, in dir: URL) {
-        guard !manifest.recordingFinished, manifest.segments.isEmpty else { return }
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-        let parts = Self.orphanMicParts(names: names, tag: manifest.tag)
-        guard !parts.isEmpty else { return }
-        log("[PostProcessor] \(manifest.tag) was killed mid-recording — trying to salvage \(parts.count) mic part(s)")
-        manifest.segments = parts.map {
-            CallSessionManifest.record(.recovered(url: dir.appendingPathComponent($0)))
         }
     }
 
-    private func publishMicTrack(_ manifest: inout CallSessionManifest, in dir: URL) {
-        guard !manifest.stages.micPublished else { return }
-        adoptOrphanParts(&manifest, in: dir)
-        guard let micURL = manifest.resolve(manifest.micFile, in: dir) else {
-            manifest.stages.micPublished = true
-            return
+    private func scheduleRetry(for manifest: CallSessionManifest, in dir: URL) {
+        guard scheduledRetries.insert(manifest.tag).inserted else { return }
+        let url = manifest.url(in: dir)
+        queue.asyncAfter(deadline: .now() + transcriptionRetryDelay) { [weak self] in
+            guard let self else { return }
+            self.scheduledRetries.remove(manifest.tag)
+            guard !self.isRecordingActive,
+                  FileManager.default.fileExists(atPath: url.path) else { return }
+            self.processBatch([url], in: dir)
         }
-        let segments = manifest.micSegments(in: dir)
-        guard !segments.isEmpty else {
-            // The mic never produced audio (permission denied, no device). Not
-            // a failure of this stage — the rest of the session still stands.
-            manifest.stages.micPublished = true
-            return
-        }
-        // The stitch may have finished just before the process died, between
-        // the rename and the manifest write. Parts gone + track present is
-        // success, not a failure to report.
-        let partsLeft = segments.contains { FileManager.default.fileExists(atPath: $0.url.path) }
-        if !partsLeft, FileManager.default.fileExists(atPath: micURL.path) {
-            manifest.stages.micPublished = true
-            return
-        }
-
-        if MicStitcher.shared.stitch(segments: segments, outputURL: micURL) {
-            manifest.stages.micPublished = true
-            manifest.save(in: dir)
-        } else {
-            log("[PostProcessor] ❌ Mic track not assembled for \(manifest.tag) — \(micURL.lastPathComponent) is missing, parts kept: \(segments.map { $0.url.lastPathComponent }.joined(separator: ", "))")
-        }
-    }
-
-    private func cancelEcho(_ manifest: inout CallSessionManifest, in dir: URL) {
-        guard !manifest.stages.echoCancelled else { return }
-        defer {
-            // Declining is a decision, not a failure: the stage is done either
-            // way, and re-running the model on the next launch would burn
-            // minutes of CPU to reach the same verdict.
-            manifest.stages.echoCancelled = true
-            manifest.save(in: dir)
-        }
-        guard let micURL = manifest.resolve(manifest.micFile, in: dir),
-              let sysURL = manifest.resolve(manifest.systemFile, in: dir),
-              FileManager.default.fileExists(atPath: micURL.path),
-              EchoCanceller.shared.isAvailable else { return }
-        if let cleaned = EchoCanceller.shared.process(micURL: micURL, systemURL: sysURL) {
-            manifest.cleanedMicFile = cleaned.lastPathComponent
-        }
-    }
-
-    private func muxVideo(_ manifest: inout CallSessionManifest, in dir: URL) {
-        guard !manifest.stages.muxed else { return }
-        guard let screenURL = manifest.resolve(manifest.screenFile, in: dir),
-              FileManager.default.fileExists(atPath: screenURL.path) else {
-            manifest.stages.muxed = true       // audio-only session, nothing to mux
-            return
-        }
-        let muxed = AudioMuxer.shared.muxNow(screenURL: screenURL,
-                                             micURL: manifest.effectiveMicURL(in: dir),
-                                             systemURL: manifest.resolve(manifest.systemFile, in: dir),
-                                             micStartSeconds: manifest.micStartSeconds,
-                                             systemStartSeconds: manifest.systemStartSeconds,
-                                             videoStartSeconds: manifest.videoStartSeconds)
-        // "No audio to mux" also ends the stage — retrying cannot conjure a
-        // track that was never recorded. Only a real ffmpeg failure retries.
-        let hasAudio = [manifest.effectiveMicURL(in: dir), manifest.resolve(manifest.systemFile, in: dir)]
-            .contains { $0.map { FileManager.default.fileExists(atPath: $0.path) } ?? false }
-        manifest.stages.muxed = muxed || !hasAudio
-        manifest.save(in: dir)
     }
 
     private func transcribe(_ manifest: inout CallSessionManifest, in dir: URL) {
         guard !manifest.stages.transcribed else { return }
-        guard transcriptionEnabled, SettingsManager.shared.autoTranscribe else {
+        switch transcriptionService.transcribe(manifest, in: dir, recordingActive: { isRecordingActive }) {
+        case .completed:
+            retryableTranscriptionTags.remove(manifest.tag)
             manifest.stages.transcribed = true
-            return
-        }
-        guard Transcriber.shared.isAvailable else {
-            log("[PostProcessor] Auto-transcribe on but whisper/model missing — skipping")
+            manifest.save(in: dir)
+        case .skipped:
             manifest.stages.transcribed = true
-            return
-        }
-
-        setTranscribing(true)
-        log("[PostProcessor] Starting transcription for \(manifest.tag)…")
-        let done = DispatchSemaphore(value: 0)
-        var settled = false
-        // Transcribe the cleaned mic but keep naming the session after the
-        // canonical file, or the transcript lands next to it under a mangled
-        // name. Offsets put both tracks on one timeline so the speaker-labeled
-        // transcript interleaves them in the order they were actually spoken.
-        Transcriber.shared.transcribeSession(micURL: manifest.effectiveMicURL(in: dir),
-                                             systemURL: manifest.resolve(manifest.systemFile, in: dir),
-                                             namingURL: manifest.resolve(manifest.micFile, in: dir),
-                                             micStartSeconds: manifest.micStartSeconds,
-                                             systemStartSeconds: manifest.systemStartSeconds,
-                                             videoStartSeconds: manifest.videoStartSeconds) { finished in
-            settled = finished
-            done.signal()
-        }
-        done.wait()
-        setTranscribing(false)
-        // Paused for a recording: the finished chunks are on disk and the stage
-        // stays open. Recording it as done here would leave the call with the
-        // half of the transcript that happened to be ready.
-        guard settled else {
+        case .paused:
             log("[PostProcessor] Transcription for \(manifest.tag) paused — resumes after the recording")
-            return
-        }
-        manifest.stages.transcribed = true
-        manifest.save(in: dir)
-        log("[PostProcessor] Transcription complete for \(manifest.tag)")
-        DispatchQueue.main.async { [weak self] in self?.onTranscriptionDone?() }
-    }
-
-    private func setTranscribing(_ value: Bool) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.isTranscribing = value
-            self.onTranscribingChanged?(value)
+        case .retryableFailure:
+            retryableTranscriptionTags.insert(manifest.tag)
+            log("[PostProcessor] Transcription for \(manifest.tag) failed temporarily")
+        case .permanentFailure:
+            log("[PostProcessor] Transcription for \(manifest.tag) failed permanently")
         }
     }
 }

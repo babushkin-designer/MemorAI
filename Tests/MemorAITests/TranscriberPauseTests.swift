@@ -106,6 +106,38 @@ final class TranscriberPauseTests: XCTestCase {
         XCTAssertEqual(left, [], "chunk cache outlived the transcript")
     }
 
+    func testFailedTranscriptWriteKeepsChunksAndReportsUnsettled() throws {
+        try requireTools()
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tag = "2026-01-06_00-00-00"
+        let mic = dir.appendingPathComponent("call_\(tag)_mic.m4a")
+        let sys = dir.appendingPathComponent("call_\(tag)_system.m4a")
+        makeTone(mic, seconds: 3, frequency: 440)
+        makeTone(sys, seconds: 3, frequency: 880)
+        let micCache = dir.appendingPathComponent("_whisper_\(tag)_mic_0.json")
+        let sysCache = dir.appendingPathComponent("_whisper_\(tag)_system_0.json")
+        try seedChunkJSON(micCache, text: "сохранённая мысль")
+        try seedChunkJSON(sysCache, text: "сохранённый ответ")
+
+        // A directory at the destination makes the atomic String.write fail
+        // without changing permissions on the whole test sandbox.
+        let destination = dir.appendingPathComponent("call_\(tag)_transcript.txt")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+
+        let done = expectation(description: "transcription returns")
+        var settled = true
+        Transcriber.shared.transcribeSession(micURL: mic, systemURL: sys) { finished in
+            settled = finished
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 60)
+
+        XCTAssertFalse(settled, "an unpublished transcript must remain retryable")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: micCache.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sysCache.path))
+    }
+
     /// A prepared track must not be reused unless it is whole. A truncated one
     /// (a kill or a timeout mid-convert) is far bigger than any header, so size
     /// cannot tell them apart — only the rename can, which is why the convert

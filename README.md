@@ -2,7 +2,7 @@
 
 Remembers everything you do on your computer for AI.
 
-MemorAI sits in your menu bar and silently captures your digital life — screen activity, clipboard history, and phone calls. Everything stays local on your machine: screenshots are OCR'd via a local RapidOCR ONNX sidecar, calls are transcribed via whisper.cpp. The result is a structured, searchable archive of your workday that's ready for AI-powered retrieval.
+MemorAI sits in your menu bar and silently captures your digital life — screen activity, clipboard history, and phone calls. Screenshots and dictation stay local; recorded calls use Deepgram for fast transcription when its Keychain API key is configured, with local whisper.cpp as the fallback. The result is a structured, searchable archive of your workday that's ready for AI-powered retrieval.
 
 ## Features
 
@@ -24,13 +24,13 @@ MemorAI sits in your menu bar and silently captures your digital life — screen
 - **Auto-detection** — monitors mic usage, starts recording when a call begins (Zoom, Teams, FaceTime, etc.)
 - **Dual-track audio** — system audio + microphone as separate files
 - **Screen recording** — optional 10 fps H.264 capture during calls
-- **Local transcription** — whisper.cpp transcribes after each call, no cloud needed
+- **Fast call transcription** — Deepgram first, local whisper.cpp fallback
 - **Efficient codecs** — HE-AAC keeps files small (~5 MB/hour per track)
 
 ### General
 - **Menu bar only** — colored dot: gray = idle, red = recording call
 - **CLI tool** — `memorai` command for status, history, settings
-- **All local** — nothing leaves your machine
+- **Local-first controls** — screen memory and dictation are local; cloud call transcription can be disabled
 
 ## Build & Run
 
@@ -41,6 +41,33 @@ open MemorAI.app
 ```
 
 macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**, and **Accessibility** permissions.
+
+Development checks require SwiftLint (`brew install swiftlint`):
+
+```bash
+tools/lint.sh
+swift build
+swift test
+```
+
+## Architecture
+
+MemorAI is one deployable macOS application, organized as a modular monolith.
+AppKit lifecycle and menu rendering live in `AppDelegate`; application work is
+split into services under `AutoRec/Services`:
+
+- `CallTranscriptionService` selects Deepgram or local Whisper and reports a
+  provider-independent outcome.
+- `CallMediaService` publishes mic segments, optionally removes echo, and
+  muxes call audio into video.
+- `CallLLMService` serializes titles, summaries, and follow-ups and owns
+  provider pacing.
+- `PostProcessor` is the durable scheduler around those services: it owns the
+  recording gate, retries, manifests, and stage ordering.
+
+These are in-process services rather than network microservices: audio files
+are local, the workflows share one lifecycle, and splitting them into daemons
+would add IPC and recovery failure modes without an independent scaling need.
 
 ## CLI
 
@@ -62,7 +89,9 @@ macOS 14+ required. On first launch, grant **Screen Recording**, **Microphone**,
 - Start/Stop/Pause call recording
 - Auto-detect Calls (on/off)
 - Record Screen during calls (on/off)
-- Auto-transcribe via Whisper (on/off)
+- Auto-transcribe Calls (on/off)
+- Use Deepgram for Calls (on/off; dictation remains local)
+- Enhance Recorded Audio (slow, off by default)
 - Screen Memory (on/off)
 - Save Clipboard (on/off)
 - Clipboard History (last 100 entries)
@@ -112,6 +141,12 @@ outside them. For a manual pass
 from a terminal, run `memorai retention run`.
 
 ## Transcription Setup
+
+For fast call transcription, store a Deepgram key in the login Keychain as a
+generic password with service `deepgram-api-key` and account equal to your
+macOS username. Disable **Use Deepgram for Calls** to keep calls local.
+
+Local Whisper remains the offline fallback and powers button dictation:
 
 ```bash
 brew install ffmpeg whisper-cpp

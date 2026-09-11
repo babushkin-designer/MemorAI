@@ -51,6 +51,12 @@ struct LLMProvider {
 /// retry) because past that point traffic bills real money. Bounded retry (2)
 /// only for transport errors and 5xx.
 class LLMClient {
+    struct ParsedContent {
+        let text: String
+        let tokensIn: Int
+        let tokensOut: Int
+    }
+
     static let shared = LLMClient()
 
     private let maxOutputTokens = 4096
@@ -72,17 +78,17 @@ class LLMClient {
     }
 
     /// Extract assistant text; returns nil when the shape is wrong or empty.
-    static func parseContent(_ data: Data) -> (text: String, tokensIn: Int, tokensOut: Int)? {
+    static func parseContent(_ data: Data) -> ParsedContent? {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = obj["choices"] as? [[String: Any]],
               let message = choices.first?["message"] as? [String: Any],
               let content = message["content"] as? String,
               !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let usage = obj["usage"] as? [String: Any]
-        return (
-            content,
-            usage?["prompt_tokens"] as? Int ?? 0,
-            usage?["completion_tokens"] as? Int ?? 0
+        return ParsedContent(
+            text: content,
+            tokensIn: usage?["prompt_tokens"] as? Int ?? 0,
+            tokensOut: usage?["completion_tokens"] as? Int ?? 0
         )
     }
 

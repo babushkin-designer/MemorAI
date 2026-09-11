@@ -27,17 +27,22 @@ class MetadataCollector {
 
     // MARK: - Window Title via Accessibility API
 
+    private func elementAttribute(_ attribute: CFString, of element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+              let value,
+              CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
     private func windowTitle(for app: NSRunningApplication?) -> String? {
         guard let pid = app?.processIdentifier else { return nil }
         let axApp = AXUIElementCreateApplication(pid)
-
-        var window: AnyObject?
-        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &window) == .success else {
-            return nil
-        }
-
+        guard let window = elementAttribute(kAXFocusedWindowAttribute as CFString, of: axApp) else { return nil }
         var title: AnyObject?
-        guard AXUIElementCopyAttributeValue(window as! AXUIElement, kAXTitleAttribute as CFString, &title) == .success else {
+        guard AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &title) == .success else {
             return nil
         }
         return title as? String
@@ -46,7 +51,7 @@ class MetadataCollector {
     // MARK: - Browser URL
 
     private func browserURL(for app: NSRunningApplication?) -> String? {
-        guard let bundleId = app?.bundleIdentifier else { return nil }
+        guard let app, let bundleId = app.bundleIdentifier else { return nil }
         let browsers = [
             "com.apple.Safari",
             "com.google.Chrome",
@@ -57,21 +62,21 @@ class MetadataCollector {
         ]
         guard browsers.contains(bundleId) else { return nil }
 
-        let axApp = AXUIElementCreateApplication(app!.processIdentifier)
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
 
         // Try AXDocument on focused window (works for Chrome-based browsers)
-        var window: AnyObject?
-        if AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &window) == .success {
+        let window = elementAttribute(kAXFocusedWindowAttribute as CFString, of: axApp)
+        if let window {
             var doc: AnyObject?
-            if AXUIElementCopyAttributeValue(window as! AXUIElement, "AXDocument" as CFString, &doc) == .success,
+            if AXUIElementCopyAttributeValue(window, "AXDocument" as CFString, &doc) == .success,
                let urlString = doc as? String {
                 return urlString
             }
         }
 
         // Fallback: search for address bar text field
-        if let window = window {
-            return findURLField(in: window as! AXUIElement, depth: 0)
+        if let window {
+            return findURLField(in: window, depth: 0)
         }
 
         return nil

@@ -9,6 +9,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var screenMemory: ScreenMemoryManager!
     private var dictation: DictationManager!
     private let settings = SettingsManager.shared
+    private let llmService = CallLLMService.shared
+    private let postProcessor = PostProcessor.shared
     private var whisperAlertShown = false
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -52,6 +54,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         requestPermissions()
         settings.ensureOutputDirectory()
+        llmService.onBusyChanged = { [weak self] _ in self?.updateMenu() }
         RetentionManager.shared.start()
 
         // --- Screen Memory (init before menu so clipboard history is available) ---
@@ -87,8 +90,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordingManager.onSystemAudioUnavailable = { [weak self] in
             self?.callDetector.reportSystemAudioUnavailable()
         }
-        recordingManager.onTranscriptionDone = { [weak self] in
-            self?.autoTitleLatestCall()
+        recordingManager.onTranscriptionDone = { [weak self] tag in
+            self?.autoTitleCall(tag)
         }
         // Post-processing outlives the app: a quit (or a crash) mid-pipeline
         // leaves the session's manifest on disk, and this is what finishes it.
@@ -119,7 +122,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func checkTranscriptionSetup() {
         guard !whisperAlertShown else { return }
         guard settings.autoTranscribe else { return }
-        guard !Transcriber.shared.isAvailable else { return }
+        let deepgramReady = settings.useDeepgramForCalls && DeepgramTranscriber.shared.isAvailable
+        guard !deepgramReady, !Transcriber.shared.isAvailable else { return }
         whisperAlertShown = true
 
         let t = Transcriber.shared
@@ -207,9 +211,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         videoItem.state = settings.recordScreen ? .on : .off
 
         let t = Transcriber.shared
-        let transcribeItem = NSMenuItem(title: "Auto-transcribe (Whisper)", action: #selector(toggleAutoTranscribe), keyEquivalent: "")
+        let deepgramReady = settings.useDeepgramForCalls && DeepgramTranscriber.shared.isAvailable
+        let provider = deepgramReady ? "Deepgram" : "Local Whisper"
+        let transcribeItem = NSMenuItem(title: "Auto-transcribe Calls (\(provider))", action: #selector(toggleAutoTranscribe), keyEquivalent: "")
         transcribeItem.target = self
-        if t.isAvailable {
+        if deepgramReady || t.isAvailable {
             transcribeItem.state = settings.autoTranscribe ? .on : .off
         } else {
             transcribeItem.state = .off
@@ -221,6 +227,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         menu.addItem(transcribeItem)
+
+        let deepgramItem = NSMenuItem(title: "Use Deepgram for Calls",
+                                      action: #selector(toggleDeepgramForCalls), keyEquivalent: "")
+        deepgramItem.target = self
+        deepgramItem.state = settings.useDeepgramForCalls ? .on : .off
+        deepgramItem.toolTip = DeepgramTranscriber.shared.isAvailable
+            ? "Dictation remains local"
+            : "deepgram-api-key is missing from Keychain; calls use local Whisper"
+        menu.addItem(deepgramItem)
+
+        let enhanceItem = NSMenuItem(title: "Enhance Recorded Audio (slow)",
+                                     action: #selector(toggleCallAudioEnhancement), keyEquivalent: "")
+        enhanceItem.target = self
+        enhanceItem.state = settings.enhanceRecordedCallAudio ? .on : .off
+        menu.addItem(enhanceItem)
 
         let setupItem = NSMenuItem(title: "Whisper Setup…", action: #selector(openWhisperSetup), keyEquivalent: "")
         setupItem.target = self
@@ -396,8 +417,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleAutoDetect() {
         settings.autoDetect.toggle()
-        if settings.autoDetect { callDetector.startMonitoring() }
-        else { callDetector.stopMonitoring() }
+        if settings.autoDetect { callDetector.startMonitoring() } else { callDetector.stopMonitoring() }
         updateMenu()
     }
 
@@ -408,6 +428,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleAutoTranscribe() {
         settings.autoTranscribe.toggle()
+        updateMenu()
+    }
+
+    @objc private func toggleDeepgramForCalls() {
+        settings.useDeepgramForCalls.toggle()
+        updateMenu()
+    }
+
+    @objc private func toggleCallAudioEnhancement() {
+        settings.enhanceRecordedCallAudio.toggle()
         updateMenu()
     }
 
@@ -432,7 +462,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let backfill = NSMenuItem(title: "🏷 Generate Missing Titles (\(untitled.count))",
                                       action: #selector(generateMissingTitles), keyEquivalent: "")
             backfill.target = self
-            backfill.isEnabled = !llmBusy
+            backfill.isEnabled = !llmService.isBusy
             submenu.addItem(backfill)
             submenu.addItem(.separator())
         }
@@ -473,7 +503,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     action: #selector(summarizeCall(_:)), keyEquivalent: "")
                 summarize.target = self
                 summarize.representedObject = session.tag
-                summarize.isEnabled = !llmBusy
+                summarize.isEnabled = !llmService.isBusy
                 sub.addItem(summarize)
 
                 let followup = NSMenuItem(
@@ -481,7 +511,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     action: #selector(draftFollowup(_:)), keyEquivalent: "")
                 followup.target = self
                 followup.representedObject = session.tag
-                followup.isEnabled = !llmBusy
+                followup.isEnabled = !llmService.isBusy
                 sub.addItem(followup)
             }
 
@@ -545,9 +575,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             manifest = .forRetranscribing(tag: tag, mic: session.micURL,
                                           system: session.systemURL, screen: session.videoURL)
         }
-        manifest.stages.transcribed = false
         log("[Menu] Transcription requested for \(tag)")
-        PostProcessor.shared.enqueue(manifest, in: dir)
+        postProcessor.enqueue(manifest, in: dir, resetTranscription: true)
     }
 
     /// The plain POSIX path, which is what gets pasted into a chat. Writing a
@@ -562,46 +591,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - LLM actions (summary / follow-up)
 
-    /// Prevents parallel LLM jobs; menu items are disabled while true.
-    private var llmBusy = false
-
     private func sessionForTag(_ tag: String) -> CallSession? {
-        CallHistory.recentSessions(outputPath: settings.outputPath, limit: 100)
-            .first { $0.tag == tag }
+        llmService.session(tag: tag, outputPath: settings.outputPath)
     }
 
-    /// Auto-title the freshest transcribed call (hooked to onTranscriptionDone),
-    /// and the manual backfill for older untitled ones.
+    /// Auto-title a completed call, and manually backfill older untitled ones.
     @objc private func generateMissingTitles() {
-        guard !llmBusy else { return }
-        llmBusy = true
-        updateMenu()
-        let outputPath = settings.outputPath
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let untitled = CallHistory.recentSessions(outputPath: outputPath, limit: 100)
-                .filter { $0.transcriptURL != nil && $0.title == nil }
-            var done = 0
-            for (i, session) in untitled.enumerated() {
-                // Bluesminds free tier rate-limits aggressively (429 after a
-                // few requests/min) — pace the batch instead of blasting it.
-                if i > 0 { Thread.sleep(forTimeInterval: 12) }
-                if CallLLM.generateTitle(for: session) { done += 1 }
-            }
-            log("[CallLLM] Title backfill: \(done)/\(untitled.count) generated")
-            DispatchQueue.main.async {
-                self?.llmBusy = false
-                self?.updateMenu()
-            }
-        }
+        llmService.generateMissingTitles(outputPath: settings.outputPath)
     }
 
-    private func autoTitleLatestCall() {
-        let outputPath = settings.outputPath
-        DispatchQueue.global(qos: .utility).async {
-            guard let latest = CallHistory.recentSessions(outputPath: outputPath, limit: 5)
-                .first(where: { $0.transcriptURL != nil && $0.title == nil }) else { return }
-            CallLLM.generateTitle(for: latest)
-        }
+    private func autoTitleCall(_ tag: String) {
+        llmService.autoTitle(tag: tag, outputPath: settings.outputPath)
     }
 
     @objc private func summarizeCall(_ sender: NSMenuItem) {
@@ -616,7 +616,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let alert = NSAlert()
         alert.messageText = "Follow-up: участники"
-        alert.informativeText = "Кто был на звонке со стороны клиента? Через запятую, можно с ролями (\"Егор — клиент, Полина — маркетолог\"). Пусто — модель определит имена сама из транскрипта."
+        alert.informativeText = "Кто был на звонке со стороны клиента? Через запятую, можно с ролями "
+            + "(\"Егор — клиент, Полина — маркетолог\"). Пусто — модель определит имена сама из транскрипта."
         alert.addButton(withTitle: "Draft")
         alert.addButton(withTitle: "Cancel")
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
@@ -631,32 +632,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func runLLMJob(kind: CallLLM.Kind, session: CallSession) {
-        guard !llmBusy else { return }
-        llmBusy = true
-        updateMenu()
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = CallLLM.generate(kind, for: session)
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.llmBusy = false
-                self.updateMenu()
-                switch result {
-                case .success(let url):
-                    NSWorkspace.shared.open(url)
-                case .failure(let error):
-                    let alert = NSAlert()
-                    alert.alertStyle = .warning
-                    if case .quotaExhausted = error {
-                        alert.messageText = "LLM tokens exhausted"
-                        alert.informativeText = "Бесплатные токены исчерпаны (insufficient_quota). Повторов не делаю — сначала разберись с биллингом/лимитами."
-                    } else {
-                        alert.messageText = "LLM request failed"
-                        alert.informativeText = error.localizedDescription
-                    }
-                    NSApp.activate(ignoringOtherApps: true)
-                    alert.runModal()
+        llmService.generate(kind, for: session) { result in
+            switch result {
+            case .success(let url):
+                NSWorkspace.shared.open(url)
+            case .failure(let error):
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                if case .quotaExhausted = error {
+                    alert.messageText = "LLM tokens exhausted"
+                    alert.informativeText = "Бесплатные токены исчерпаны (insufficient_quota). Повторов не делаю — сначала разберись с биллингом/лимитами."
+                } else {
+                    alert.messageText = "LLM request failed"
+                    alert.informativeText = error.localizedDescription
                 }
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
             }
         }
     }
@@ -773,7 +764,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item)
         }
 
-        if let event = NSApp.currentEvent, let view = sender.menu?.highlightedItem?.view ?? statusItem.button {
+        if NSApp.currentEvent != nil,
+           let view = sender.menu?.highlightedItem?.view ?? statusItem.button {
             menu.popUp(positioning: nil, at: .zero, in: view)
         }
     }

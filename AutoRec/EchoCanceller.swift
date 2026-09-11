@@ -65,8 +65,9 @@ class EchoCanceller {
     private let queue = DispatchQueue(label: "com.local.memorai.aec", qos: .utility)
 
     private let ffmpegPath: String = {
-        for path in ["/opt/homebrew/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
-            if FileManager.default.fileExists(atPath: path) { return path }
+        for path in ["/opt/homebrew/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+            where FileManager.default.fileExists(atPath: path) {
+            return path
         }
         return "ffmpeg"
     }()
@@ -127,10 +128,13 @@ class EchoCanceller {
     static func diagnosis(for m: Metrics) -> String? {
         guard m.erleDb != nil else { return nil }
         if m.delayConfidence < weakDelayConfidence || abs(m.delayMs) >= delaySearchWindowMs - 50 {
-            return String(format: "lag %+.0f ms at confidence %.3f — that is the edge of the ±1 s search window, so measure the true offset before trusting this number",
+            return String(format: "lag %+.0f ms at confidence %.3f — that is the edge of the ±1 s search window,"
+                          + " so measure the true offset before trusting this number",
                           m.delayMs, m.delayConfidence)
         }
-        return String(format: "lag %+.0f ms found at confidence %.2f, so the echo is real and simply will not cancel — open speakers rather than headphones do that, and the mic track keeps a copy of the far side that doubles it in the transcript",
+        return String(format: "lag %+.0f ms found at confidence %.2f, so the echo is real and simply will not cancel —"
+                      + " open speakers rather than headphones do that, and the mic track keeps a copy of the far side"
+                      + " that doubles it in the transcript",
                       m.delayMs, m.delayConfidence)
     }
 

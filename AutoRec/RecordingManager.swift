@@ -13,12 +13,14 @@ class RecordingManager {
     /// Fired once if the session produced no system audio within the warmup window
     /// (mic-only voice memo or headphones-only call).
     var onSystemAudioUnavailable: (() -> Void)?
-    /// Fired when transcription completes after a recording
-    var onTranscriptionDone: (() -> Void)?
+    /// Fired with the exact session tag when transcription completes.
+    var onTranscriptionDone: ((String) -> Void)?
 
     private var systemAudioRecorder: SystemAudioRecorder?
     private var micRecorder: MicRecorder?
     private let settings = SettingsManager.shared
+    private let postProcessor: PostProcessor
+    private let transcriptionService: CallTranscriptionService
     /// Completions queued when `stopRecording` is called again while a stop
     /// `Task` is already in flight (state == .stopping); drained once that
     /// in-flight task finishes finalizing the writers.
@@ -37,24 +39,25 @@ class RecordingManager {
     private var currentManifest: CallSessionManifest?
     private var currentBaseDir: URL?
 
-    /// Owned by PostProcessor now — post-processing outlives a recording (and,
-    /// across a manifest, the process itself).
-    var isTranscribing: Bool { PostProcessor.shared.isTranscribing }
+    var isTranscribing: Bool { transcriptionService.isTranscribing }
 
-    init() {
-        PostProcessor.shared.onTranscribingChanged = { [weak self] _ in
+    init(postProcessor: PostProcessor = .shared,
+         transcriptionService: CallTranscriptionService = .shared) {
+        self.postProcessor = postProcessor
+        self.transcriptionService = transcriptionService
+        transcriptionService.onStateChanged = { [weak self] _ in
             guard let self = self else { return }
             self.onStateChange?(self.state)
         }
-        PostProcessor.shared.onTranscriptionDone = { [weak self] in
-            self?.onTranscriptionDone?()
+        transcriptionService.onCompleted = { [weak self] tag in
+            self?.onTranscriptionDone?(tag)
         }
     }
 
     /// Finishes any session left half-processed by a previous run. Call once,
     /// at launch, after the callbacks above are wired.
     func resumeUnfinishedSessions() {
-        PostProcessor.shared.resumePending(in: URL(fileURLWithPath: settings.outputPath))
+        postProcessor.resumePending(in: URL(fileURLWithPath: settings.outputPath))
     }
 
     func startRecording(source: String = "manual") {
@@ -99,7 +102,7 @@ class RecordingManager {
         // Close the gate BEFORE the recorders come up, and cancel whatever the
         // pipeline is already running: the call must not share the machine with
         // whisper or the AEC sidecar.
-        PostProcessor.shared.setRecordingActive(true, dir: baseDir)
+        postProcessor.setRecordingActive(true, dir: baseDir)
 
         startTask = Task {
             do {
@@ -151,7 +154,7 @@ class RecordingManager {
                 // Nothing was recorded, so there is nothing to post-process.
                 if let dir = currentBaseDir { currentManifest?.remove(in: dir) }
                 currentManifest = nil
-                PostProcessor.shared.setRecordingActive(false, dir: baseDir)
+                postProcessor.setRecordingActive(false, dir: baseDir)
                 AudioGlitchMonitor.shared.stop()
                 setState(.idle)
                 onRecordingActiveChanged?(false)
@@ -207,7 +210,7 @@ class RecordingManager {
             AudioGlitchMonitor.shared.stop()
             // Recorders are down: the pipeline may have the machine back, and
             // anything deferred while the call ran gets picked up off disk.
-            PostProcessor.shared.setRecordingActive(false, dir: baseDir)
+            postProcessor.setRecordingActive(false, dir: baseDir)
             // Track start times (host clock) — AudioMuxer aligns the three
             // files with these; grab them before the recorders are released.
             let micStart = micRecorder?.firstBufferHostSeconds
@@ -267,7 +270,7 @@ class RecordingManager {
             // Echo cancellation, muxing and transcription take minutes on a
             // long call — far longer than a quit may be held up. They run in
             // PostProcessor, off the manifest, and survive the app going away.
-            PostProcessor.shared.enqueue(manifest, in: baseDir)
+            postProcessor.enqueue(manifest, in: baseDir)
         }
     }
 

@@ -1,0 +1,49 @@
+included:
+  - AutoRec
+  - Tests/MemorAITests
+
+excluded:
+  - .build
+  - MemorAI.app
+
+# Short domain names (`fm`, `ms`, `x`) and trailing commas are established in
+# this codebase and do not reduce correctness. Keep the gate focused on defects
+# and maintainability regressions instead of reformatting historical code.
+disabled_rules:
+  - identifier_name
+  - trailing_comma
+
+line_length:
+  warning: 160
+  error: 220
+  ignores_comments: true
+  ignores_urls: true
+
+# Codable's nested CodingKeys is the normal shape used throughout this app.
+nesting:
+  type_level: 2
+
+# This is a single-target macOS app with cohesive recorder/controller types.
+# These limits still reject growth beyond the largest reviewed implementation
+# without forcing low-value file splits solely to satisfy generic defaults.
+cyclomatic_complexity:
+  warning: 18
+  error: 25
+
+function_body_length:
+  warning: 150
+  error: 200
+
+function_parameter_count:
+  warning: 10
+  error: 12
+
+type_body_length:
+  warning: 750
+  error: 900
+
+file_length:
+  warning: 900
+  error: 1100
+
+reporter: xcode

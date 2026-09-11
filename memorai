@@ -67,6 +67,8 @@ cmd_status() {
     local auto_detect=$(defaults read "$BUNDLE_ID" autoDetect 2>/dev/null || echo "1")
     local record_screen=$(defaults read "$BUNDLE_ID" recordScreen 2>/dev/null || echo "1")
     local auto_transcribe=$(defaults read "$BUNDLE_ID" autoTranscribe 2>/dev/null || echo "1")
+    local deepgram_calls=$(defaults read "$BUNDLE_ID" useDeepgramForCalls 2>/dev/null || echo "1")
+    local enhance_audio=$(defaults read "$BUNDLE_ID" enhanceRecordedCallAudio 2>/dev/null || echo "0")
 
     echo "Screen Memory:    $([ "$screen_mem" = "1" ] && echo ON || echo OFF)"
     echo "Save Clipboard:   $([ "$clipboard" = "1" ] && echo ON || echo OFF)"
@@ -74,6 +76,8 @@ cmd_status() {
     echo "Auto-detect Calls:$([ "$auto_detect" = "1" ] && echo " ON" || echo " OFF")"
     echo "Record Screen:    $([ "$record_screen" = "1" ] && echo ON || echo OFF)"
     echo "Auto-transcribe:  $([ "$auto_transcribe" = "1" ] && echo ON || echo OFF)"
+    echo "Deepgram Calls:   $([ "$deepgram_calls" = "1" ] && echo ON || echo OFF)"
+    echo "Enhance Audio:    $([ "$enhance_audio" = "1" ] && echo ON || echo OFF)"
     echo ""
 
     # Excluded apps
@@ -227,9 +231,17 @@ cmd_set() {
             defaults write "$BUNDLE_ID" autoDetect -bool "$value"
             echo "Auto-detect Calls: $value"
             ;;
+        deepgram-calls)
+            defaults write "$BUNDLE_ID" useDeepgramForCalls -bool "$value"
+            echo "Deepgram for Calls: $value"
+            ;;
+        enhance-call-audio)
+            defaults write "$BUNDLE_ID" enhanceRecordedCallAudio -bool "$value"
+            echo "Enhance Recorded Call Audio: $value"
+            ;;
         *)
             echo "Unknown setting: $key"
-            echo "Available: screen-memory, clipboard, interval, auto-detect"
+            echo "Available: screen-memory, clipboard, interval, auto-detect, deepgram-calls, enhance-call-audio"
             return 1
             ;;
     esac
@@ -528,6 +540,8 @@ Commands:
     clipboard true/false
     interval <seconds>
     auto-detect true/false
+    deepgram-calls true/false
+    enhance-call-audio true/false
 
   exclude add <bundle-id>   Add app to exclusion list
   exclude remove <bundle-id>  Remove app from exclusion list

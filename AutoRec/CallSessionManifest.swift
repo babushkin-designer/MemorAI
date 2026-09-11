@@ -5,7 +5,7 @@ import AVFoundation
 /// Written when the recording starts, updated as each stage completes, removed
 /// when there is nothing left to do.
 ///
-/// Why it exists: post-processing (publish mic → cancel echo → mux → transcribe)
+/// Why it exists: post-processing (publish mic → transcribe → cancel echo → mux)
 /// takes minutes on a long call, and the process can go away in the middle of
 /// it. On 2026-08-10 the user quit during a call; ffmpeg had already built
 /// `call_<tag>_screen.muxing.mp4` with sound, the atomic swap never happened,
@@ -55,8 +55,9 @@ struct CallSessionManifest: Codable {
     var systemStartSeconds: Double?
     var videoStartSeconds: Double?
     var segments: [SegmentRecord] = []
-    /// Set when the echo canceller produced a track worth using; the muxer and
-    /// the transcriber consume this one instead of the raw mic.
+    /// Set when the echo canceller produced a track worth using; the muxer
+    /// consumes this one instead of the raw mic. Transcription runs first from
+    /// the separate raw tracks.
     var cleanedMicFile: String?
     var stages = Stages()
     var attempts = 0

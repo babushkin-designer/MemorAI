@@ -71,7 +71,7 @@ final class HallucinationFilterTests: XCTestCase {
         XCTAssertEqual(DictationManager.cleanDictationText(raw), "Мысль закончена.")
     }
 
-    func testParseWhisperJSONDropsHallucinatedSegment() {
+    func testParseWhisperJSONDropsHallucinatedSegment() throws {
         let json = """
         {"transcription":[
           {"offsets":{"from":0,"to":1000},"text":" Реальная речь про проект"},
@@ -80,18 +80,18 @@ final class HallucinationFilterTests: XCTestCase {
         """
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString + ".json")
-        try! json.write(to: url, atomically: true, encoding: .utf8)
+        try json.write(to: url, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: url) }
 
         let segs = Transcriber.parseWhisperJSON(url, offsetMs: 0)
         XCTAssertEqual(segs?.map { $0.text }, ["Реальная речь про проект"])
     }
 
-    func testDeduplicateTranscriptDropsOutroLine() {
+    func testDeduplicateTranscriptDropsOutroLine() throws {
         let content = "Реальная строка разговора\nПродолжение следует...\nЕще одна реальная строка"
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString + ".txt")
-        try! content.write(to: url, atomically: true, encoding: .utf8)
+        try content.write(to: url, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: url) }
 
         Transcriber.shared.deduplicateTranscript(at: url)

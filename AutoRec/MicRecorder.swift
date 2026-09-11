@@ -25,6 +25,14 @@ import ObjCTry
 /// the engine from its own callback, and `removeTap` waits for that callback
 /// to return.
 class MicRecorder {
+    private struct RecordingSummary {
+        let bufferCount: UInt64
+        let segmentCount: Int
+        let gapCount: Int
+        let gapSeconds: Double
+        let maxGapSeconds: Double
+    }
+
     /// One continuous stretch of mic audio written in a single audio format.
     /// A mid-call input-device switch ends the current segment and opens the
     /// next; MicStitcher joins them back into `outputURL` when recording stops.
@@ -203,17 +211,23 @@ class MicRecorder {
         engine?.stop()
         engine = nil
 
-        let (count, segmentCount, gaps, gapSeconds, maxGap) = lock.withLock { () -> (UInt64, Int, Int, Double, Double) in
+        let summary = lock.withLock { () -> RecordingSummary in
             closeCurrentSegmentLocked()
             _silenceStart = nil
             _isSilent = false
-            return (_bufferCount, _segments.count, _tapGaps, _tapGapSeconds, _tapMaxGapSeconds)
+            return RecordingSummary(
+                bufferCount: _bufferCount,
+                segmentCount: _segments.count,
+                gapCount: _tapGaps,
+                gapSeconds: _tapGapSeconds,
+                maxGapSeconds: _tapMaxGapSeconds
+            )
         }
-        let extra = segmentCount > 1 ? " in \(segmentCount) segments" : ""
-        log("[MicRecorder] Recording stopped (\(count) buffers total\(extra))")
-        if gaps > 0 {
+        let extra = summary.segmentCount > 1 ? " in \(summary.segmentCount) segments" : ""
+        log("[MicRecorder] Recording stopped (\(summary.bufferCount) buffers total\(extra))")
+        if summary.gapCount > 0 {
             log(String(format: "[MicRecorder] Tap health — %d late callback(s), %.3fs unaccounted, max %.3fs",
-                       gaps, gapSeconds, maxGap))
+                       summary.gapCount, summary.gapSeconds, summary.maxGapSeconds))
         }
     }
 
@@ -274,7 +288,10 @@ class MicRecorder {
                file.processingFormat.sampleRate != nativeSampleRate
                 || file.processingFormat.channelCount != nativeChannels {
                 _expectedNextHost = nil
-                notices.append("[MicRecorder] Input format changed mid-recording (\(Int(file.processingFormat.sampleRate))Hz/\(file.processingFormat.channelCount)ch → \(Int(nativeSampleRate))Hz/\(nativeChannels)ch) — continuing in a new segment")
+                let oldFormat = "\(Int(file.processingFormat.sampleRate))Hz/\(file.processingFormat.channelCount)ch"
+                let newFormat = "\(Int(nativeSampleRate))Hz/\(nativeChannels)ch"
+                notices.append("[MicRecorder] Input format changed mid-recording"
+                    + " (\(oldFormat) → \(newFormat)) — continuing in a new segment")
                 rollToNextSegmentLocked()
             }
 
@@ -294,7 +311,8 @@ class MicRecorder {
                     AVLinearPCMIsFloatKey: true,
                 ]
                 if !useAAC {
-                    notices.append("[MicRecorder] \(nativeChannels)ch input — beyond what AAC can encode, writing LPCM \(_currentSegmentURL.lastPathComponent) (converted at stop)")
+                    notices.append("[MicRecorder] \(nativeChannels)ch input — beyond what AAC can encode,"
+                        + " writing LPCM \(_currentSegmentURL.lastPathComponent) (converted at stop)")
                 }
                 _audioFile = try AVAudioFile(
                     forWriting: _currentSegmentURL,

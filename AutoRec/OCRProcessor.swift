@@ -33,7 +33,7 @@ class OCRProcessor {
     private var sidecarOut: FileHandle?
     private var outBuffer = Data()
     private var consecutiveFailures = 0
-    private var retryAfter: Date? = nil
+    private var retryAfter: Date?
     private let maxConsecutiveFailures = 3
     private let retryCooldown: TimeInterval = 600  // 10 min
 

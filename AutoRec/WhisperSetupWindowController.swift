@@ -149,7 +149,7 @@ class WhisperSetupWindowController: NSWindowController {
             installBrewHint.isHidden = true
             installWhisperButton.isHidden = true
             installWhisperHint.isHidden = true
-        } else if let _ = brewPath {
+        } else if brewPath != nil {
             // Homebrew found, whisper missing → show step 2 only
             whisperStatusLabel.stringValue = "❌ Not found"
             whisperStatusLabel.textColor = .systemRed

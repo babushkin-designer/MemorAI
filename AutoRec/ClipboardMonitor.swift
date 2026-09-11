@@ -129,7 +129,9 @@ class ClipboardMonitor {
             } catch {
                 if !reportedFailure {
                     reportedFailure = true
-                    log("[Clipboard] ❌ Could not append to clipboard.jsonl: \(error.localizedDescription) — holding entries and retrying every \(Int(retryInterval))s")
+                    let delay = Int(retryInterval)
+                    log("[Clipboard] ❌ Could not append to clipboard.jsonl: \(error.localizedDescription)"
+                        + " — holding entries and retrying every \(delay)s")
                 }
                 hold(entry)
                 retryAfter = Date().addingTimeInterval(retryInterval)
@@ -143,7 +145,6 @@ class ClipboardMonitor {
             recentEntries.removeLast()
         }
     }
-
 
     private func hold(_ entry: [String: Any]) {
         pending.append(entry)

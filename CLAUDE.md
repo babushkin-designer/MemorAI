@@ -2,13 +2,17 @@
 
 macOS menu-bar app (Swift/AppKit, SwiftPM, no external deps) that records
 screen activity (screenshots + OCR), clipboard, and calls (dual-track audio,
-optional screen video, whisper.cpp transcription). All data local. This is a
+optional screen video, Deepgram-first call transcription with whisper.cpp
+fallback, and local whisper.cpp dictation). Screen memory and dictation stay
+local; call audio leaves the machine only when Deepgram is enabled. This is a
 personal fork; do not push to any remote.
 
 ## Build / verify
 
 - `swift build` — the primary gate (repo root). ~10 s warm.
-- `swift test` — 159 tests; must stay offline and must never touch the real
+- `tools/lint.sh` — strict SwiftLint gate. The repository has no lint baseline;
+  every configured warning fails the command.
+- `swift test` — 169 tests; must stay offline and must never touch the real
   data dir (fixture dirs only). ffmpeg/AEC-dependent tests skip themselves
   where those are not installed.
 - `bash bundle.sh` — builds MemorAI.app and codesigns it (stable identity so
@@ -19,12 +23,16 @@ personal fork; do not push to any remote.
 
 ## Layout
 
-- `AutoRec/` — all Swift sources (single executable target `MemorAI`).
+- `AutoRec/` — all Swift sources (single executable target `MemorAI`, organized
+  as an in-process modular monolith).
   Key files: AppDelegate (menu bar UI + lifecycle), RecordingManager
   (start/stop state machine, `@MainActor`), SystemAudioRecorder (SCStream:
   system audio + screen), MicRecorder (AVAudioEngine), CallDetector (CoreAudio
-  per-process mic usage), PostProcessor + CallSessionManifest (everything after
-  the recorders stop), MicStitcher (joins mic segments), EchoCanceller
+  per-process mic usage), PostProcessor + CallSessionManifest (durable stage
+  scheduler after the recorders stop), `Services/CallTranscriptionService`
+  (Deepgram/Whisper selection), `Services/CallMediaService` (stitch/AEC/mux),
+  `Services/CallLLMService` (serialized title/summary/follow-up jobs),
+  MicStitcher (joins mic segments), EchoCanceller
   (`aec_sidecar.py`), AudioMuxer, ScreenMemoryManager (screenshot loop),
   OCRProcessor (RapidOCR Python sidecar — `ocr_sidecar.py`), Transcriber
   (ffmpeg + whisper-cli subprocesses), ClipboardMonitor, SettingsManager
@@ -75,16 +83,19 @@ MicRecorder writes `_mic.part<N>` segments (a new one on every engine restart �
 device switches change the format, and a file's format is fixed when opened).
 
 Post-processing (PostProcessor, off a `_session.json` manifest written at
-start): publish `_mic.m4a` from the segments → EchoCanceller → AudioMuxer →
-Transcriber. Each stage is idempotent and recorded as it completes, so quitting
+start): publish `_mic.m4a` from the segments → Deepgram call transcription
+(two source tracks uploaded concurrently; local Whisper fallback) → optional
+EchoCanceller → AudioMuxer. Each stage is idempotent and recorded as it completes, so quitting
 or crashing mid-pipeline only costs the stage in flight; the next launch calls
 `resumeUnfinishedSessions()` and finishes the rest. Quit waits for the writers
 only — never for ffmpeg or whisper.
 
-Post-processing NEVER runs while a recording is in progress. The gate closes
+CPU-heavy post-processing NEVER runs while a recording is in progress. The gate closes
 before the recorders start (`PostProcessor.setRecordingActive`), terminates the
 child process in flight, and reopens 15 s after the session stops; the deferred
-session is picked back up off its manifest. Whisper on the GPU plus the AEC
+session is picked back up off its manifest. A Deepgram upload that was already
+in flight may finish because it is network-only; its completed transcript is
+preserved before the pipeline defers AEC/mux. Whisper on the GPU plus the AEC
 sidecar on top of a live call is what made the speakers crackle mid-conversation
 (measured 2026-08-19: whisper 08:17:53–08:25:41 across a call recorded
 08:20:12–08:33:34). A stage cut short must NOT be recorded as done — an

@@ -16,8 +16,9 @@ class AudioMuxer {
     static let outputSampleRate = 48000
 
     private let ffmpegPath: String = {
-        for path in ["/opt/homebrew/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
-            if FileManager.default.fileExists(atPath: path) { return path }
+        for path in ["/opt/homebrew/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+            where FileManager.default.fileExists(atPath: path) {
+            return path
         }
         return "ffmpeg"
     }()

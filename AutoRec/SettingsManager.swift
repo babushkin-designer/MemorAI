@@ -39,6 +39,24 @@ class SettingsManager {
         set { defaults.set(newValue, forKey: "autoTranscribe") }
     }
 
+    /// Cloud transcription is for recorded calls only. Dictation stays on the
+    /// local whisper-server regardless of this setting.
+    var useDeepgramForCalls: Bool {
+        get {
+            if defaults.object(forKey: "useDeepgramForCalls") == nil { return true }
+            return defaults.bool(forKey: "useDeepgramForCalls")
+        }
+        set { defaults.set(newValue, forKey: "useDeepgramForCalls") }
+    }
+
+    /// Offline AEC is useful for listening to the recording, but costs roughly
+    /// real time and is not needed when transcription receives separate mic
+    /// and system tracks. Keep it opt-in and off the transcript's critical path.
+    var enhanceRecordedCallAudio: Bool {
+        get { defaults.bool(forKey: "enhanceRecordedCallAudio") }
+        set { defaults.set(newValue, forKey: "enhanceRecordedCallAudio") }
+    }
+
     // GONE: `micEchoCancellation` (Apple voice processing on the capture
     // engine). Echo cancellation now happens offline, after the call, in
     // EchoCanceller — and the live path is not coming back. Voice processing

@@ -30,8 +30,9 @@ class DictationManager {
     }
 
     private let ffmpegPath: String = {
-        for path in ["/opt/homebrew/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
-            if FileManager.default.fileExists(atPath: path) { return path }
+        for path in ["/opt/homebrew/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+            where FileManager.default.fileExists(atPath: path) {
+            return path
         }
         return "ffmpeg"
     }()
@@ -411,13 +412,16 @@ class DictationManager {
         let boundary = "memorai-\(UUID().uuidString)"
         var body = Data()
         func field(_ name: String, _ value: String) {
-            body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
+            body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8))
         }
         field("response_format", "json")
         field("temperature", "0.0")
-        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
+        let fileHeader = "--\(boundary)\r\n"
+            + "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
+            + "Content-Type: audio/wav\r\n\r\n"
+        body.append(Data(fileHeader.utf8))
         body.append(audioData)
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
 
         var request = URLRequest(url: url, timeoutInterval: 300)
         request.httpMethod = "POST"

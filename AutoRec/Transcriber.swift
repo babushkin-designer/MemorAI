@@ -19,8 +19,9 @@ class Transcriber {
     static let shared = Transcriber()
 
     private let ffmpegPath: String = {
-        for path in ["/opt/homebrew/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
-            if FileManager.default.fileExists(atPath: path) { return path }
+        for path in ["/opt/homebrew/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+            where FileManager.default.fileExists(atPath: path) {
+            return path
         }
         return "ffmpeg"
     }()
@@ -65,6 +66,22 @@ class Transcriber {
         guard let wp = resolvedWhisperPath else { return false }
         return FileManager.default.fileExists(atPath: wp) &&
                FileManager.default.fileExists(atPath: resolvedModelPath)
+    }
+
+    static func sessionTag(for reference: URL) -> String {
+        reference.deletingPathExtension().lastPathComponent
+            .replacingOccurrences(of: "_mic", with: "")
+            .replacingOccurrences(of: "_system", with: "")
+            .replacingOccurrences(of: "call_", with: "")
+    }
+
+    static func transcriptURL(for reference: URL) -> URL {
+        let stem = reference.deletingPathExtension().lastPathComponent
+            .replacingOccurrences(of: "_mic", with: "_transcript")
+            .replacingOccurrences(of: "_system", with: "_transcript")
+        return reference.deletingLastPathComponent()
+            .appendingPathComponent(stem)
+            .appendingPathExtension("txt")
     }
 
     /// Transcribe a recording session by merging mic + system audio into one file.
@@ -124,17 +141,12 @@ class Transcriber {
             let refURL = namingURL ?? (micOK ? micURL : systemURL)!
             let dir = refURL.deletingLastPathComponent()
             let baseName = refURL.deletingPathExtension().lastPathComponent
-            let sessionTag = baseName
-                .replacingOccurrences(of: "_mic", with: "")
-                .replacingOccurrences(of: "_system", with: "")
-                .replacingOccurrences(of: "call_", with: "")
-            let transcriptBase = dir.appendingPathComponent(
-                baseName.replacingOccurrences(of: "_mic", with: "_transcript")
-                        .replacingOccurrences(of: "_system", with: "_transcript")
-            )
-            let txtPath = transcriptBase.appendingPathExtension("txt")
+            let sessionTag = Self.sessionTag(for: refURL)
+            let txtPath = Self.transcriptURL(for: refURL)
 
-            if FileManager.default.fileExists(atPath: txtPath.path) {
+            var existingIsDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: txtPath.path, isDirectory: &existingIsDirectory),
+               !existingIsDirectory.boolValue {
                 log("[Transcriber] Transcript already exists: \(txtPath.lastPathComponent)")
                 finish(true)
                 return
@@ -192,9 +204,17 @@ class Transcriber {
             }
 
             if !fullTranscript.isEmpty {
-                try? fullTranscript.write(to: txtPath, atomically: true, encoding: .utf8)
-                deduplicateTranscript(at: txtPath)
-                log("[Transcriber] ✅ Transcript saved: \(txtPath.lastPathComponent)")
+                do {
+                    try fullTranscript.write(to: txtPath, atomically: true, encoding: .utf8)
+                    deduplicateTranscript(at: txtPath)
+                    log("[Transcriber] ✅ Transcript saved: \(txtPath.lastPathComponent)")
+                } catch {
+                    // Keep the chunk cache: a later retry can publish the same
+                    // completed inference without running the model again.
+                    log("[Transcriber] ❌ Could not save transcript: \(error.localizedDescription)")
+                    finish(false)
+                    return
+                }
             } else {
                 log("[Transcriber] ❌ Whisper produced no output")
             }
@@ -369,7 +389,6 @@ class Transcriber {
             try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
         }
     }
-
 
     /// The one place whisper is invoked from. There used to be three copies of
     /// this list and they had already drifted: `-t 2` was added to two of them
@@ -718,7 +737,7 @@ class Transcriber {
 
         // Pass 1: collapse exact consecutive duplicates
         var deduped: [String] = []
-        var prevTrimmed: String? = nil
+        var prevTrimmed: String?
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty || trimmed != prevTrimmed {

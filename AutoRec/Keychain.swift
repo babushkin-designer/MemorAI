@@ -3,7 +3,7 @@ import Security
 
 /// Read-only access to generic passwords in the login Keychain.
 /// API keys live there as global items (service = "bluesminds-api-key" /
-/// "openai-api-key", account = current user) so every project on this machine
+/// "openai-api-key" / "deepgram-api-key", account = current user) so every project on this machine
 /// shares one copy. First read from the app may show a Keychain permission
 /// prompt — answer "Always Allow".
 enum Keychain {
