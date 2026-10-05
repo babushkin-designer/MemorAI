@@ -26,6 +26,7 @@ struct CallSessionManifest: Codable {
         let firstHostSeconds: Double?
         let frameCount: Int64
         let sampleRate: Double
+        var preservesGap: Bool?
     }
 
     struct Stages: Codable {
@@ -35,8 +36,9 @@ struct CallSessionManifest: Codable {
         var echoCancelled = false
         var muxed = false
         var transcribed = false
+        var systemTimelineRestored: Bool?
 
-        var allDone: Bool { micPublished && echoCancelled && muxed && transcribed }
+        var allDone: Bool { micPublished && echoCancelled && muxed && transcribed && systemTimelineRestored != false }
     }
 
     static let currentVersion = 1
@@ -49,6 +51,7 @@ struct CallSessionManifest: Codable {
     let tag: String
     var micFile: String?
     var systemFile: String?
+    var systemAudioTimeline: SystemAudioTimeline?
     var screenFile: String?
     /// Host-clock starts (mic: first tap buffer; system/video: first PTS).
     var micStartSeconds: Double?
@@ -164,7 +167,7 @@ struct CallSessionManifest: Codable {
             MicRecorder.Segment(url: dir.appendingPathComponent($0.file),
                                 firstBufferHostSeconds: $0.firstHostSeconds,
                                 frameCount: $0.frameCount,
-                                sampleRate: $0.sampleRate)
+                                sampleRate: $0.sampleRate, preservesGap: $0.preservesGap ?? false)
         }
     }
 
@@ -172,6 +175,6 @@ struct CallSessionManifest: Codable {
         SegmentRecord(file: segment.url.lastPathComponent,
                       firstHostSeconds: segment.firstBufferHostSeconds,
                       frameCount: Int64(segment.frameCount),
-                      sampleRate: segment.sampleRate)
+                      sampleRate: segment.sampleRate, preservesGap: segment.preservesGap)
     }
 }

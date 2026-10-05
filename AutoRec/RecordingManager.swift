@@ -21,6 +21,9 @@ class RecordingManager {
     private let settings = SettingsManager.shared
     private let postProcessor: PostProcessor
     private let transcriptionService: CallTranscriptionService
+    private let outputDirectory: URL?
+    private let makeSystemRecorder: (URL, URL?) -> SystemAudioRecorder
+    private let makeMicRecorder: (URL) -> MicRecorder
     /// Completions queued when `stopRecording` is called again while a stop
     /// `Task` is already in flight (state == .stopping); drained once that
     /// in-flight task finishes finalizing the writers.
@@ -42,7 +45,13 @@ class RecordingManager {
     var isTranscribing: Bool { transcriptionService.isTranscribing }
 
     init(postProcessor: PostProcessor = .shared,
-         transcriptionService: CallTranscriptionService = .shared) {
+         transcriptionService: CallTranscriptionService = .shared,
+         outputDirectory: URL? = nil,
+         makeSystemRecorder: @escaping (URL, URL?) -> SystemAudioRecorder = { SystemAudioRecorder(audioURL: $0, videoURL: $1) },
+         makeMicRecorder: @escaping (URL) -> MicRecorder = { MicRecorder(outputURL: $0) }) {
+        self.outputDirectory = outputDirectory
+        self.makeSystemRecorder = makeSystemRecorder
+        self.makeMicRecorder = makeMicRecorder
         self.postProcessor = postProcessor
         self.transcriptionService = transcriptionService
         transcriptionService.onStateChanged = { [weak self] _ in
@@ -69,10 +78,12 @@ class RecordingManager {
         setState(.starting)
         onRecordingActiveChanged?(true)
 
-        settings.ensureOutputDirectory()
+        if let outputDirectory {
+            try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        } else { settings.ensureOutputDirectory() }
 
         let timestamp = Self.timestamp()
-        let baseDir = URL(fileURLWithPath: settings.outputPath)
+        let baseDir = outputDirectory ?? URL(fileURLWithPath: settings.outputPath)
 
         let sysURL = baseDir.appendingPathComponent("call_\(timestamp)_system.m4a")
         let micURL = baseDir.appendingPathComponent("call_\(timestamp)_mic.m4a")
@@ -106,7 +117,7 @@ class RecordingManager {
 
         startTask = Task {
             do {
-                let sysRec = SystemAudioRecorder(audioURL: sysURL, videoURL: vidURL)
+                let sysRec = makeSystemRecorder(sysURL, vidURL)
                 // Wire up silence / availability / error signals
                 sysRec.onSilenceChanged = { [weak self] silent in
                     self?.onSilenceChanged?(silent)
@@ -123,21 +134,29 @@ class RecordingManager {
                 try await sysRec.start()
                 AudioGlitchMonitor.shared.snapshot("after SCStream start")
 
-                let micRec = MicRecorder(outputURL: micURL)
+                let micRec = makeMicRecorder(micURL)
                 micRec.onSilenceChanged = { [weak self] silent in
                     self?.onMicSilenceChanged?(silent)
                 }
-                // A dead mic ends the session, the same way an SCStream error
-                // does. Keeping the manager in `.recording` around a stopped
-                // recorder left the system track writing into a session that
-                // nothing would ever finalize.
+                // A failed microphone retains its closed parts and leaves the
+                // system/screen tracks running until the normal session stop.
                 micRec.onFatalError = { [weak self] in
                     guard let self = self, self.state == .recording || self.state == .starting else { return }
-                    log("[RecordingManager] Mic recorder failed — stopping session")
-                    self.stopRecording(source: "mic-error")
+                    log("[RecordingManager] Microphone unavailable — retaining system/screen recording")
                 }
                 self.micRecorder = micRec
-                try micRec.start()
+                do {
+                    try micRec.start()
+                } catch {
+                    // Keep the already running system/screen capture. A mic
+                    // route failure must not throw away the other tracks.
+                    micRec.stop()
+                    self.micRecorder = nil
+                    self.currentMicURL = nil
+                    self.currentManifest?.micFile = nil
+                    self.currentManifest?.save(in: baseDir)
+                    log("[RecordingManager] Mic failed to start — continuing system-only: \(error.localizedDescription)")
+                }
                 // If our second input client reconfigures the shared devices,
                 // this snapshot differs from the one above — that is the whole
                 // question, answered by measurement.
@@ -208,14 +227,12 @@ class RecordingManager {
             await systemAudioRecorder?.stop()
             AudioGlitchMonitor.shared.snapshot("after SCStream stop")
             AudioGlitchMonitor.shared.stop()
-            // Recorders are down: the pipeline may have the machine back, and
-            // anything deferred while the call ran gets picked up off disk.
-            postProcessor.setRecordingActive(false, dir: baseDir)
             // Track start times (host clock) — AudioMuxer aligns the three
             // files with these; grab them before the recorders are released.
             let micStart = micRecorder?.firstBufferHostSeconds
             let sysStart = systemAudioRecorder?.audioFirstPTSSeconds
             let vidStart = systemAudioRecorder?.videoFirstPTSSeconds
+            let systemTimeline = systemAudioRecorder?.audioTimeline
             // An input-device switch splits the mic track; rejoin it before
             // anything downstream reads micURL, so AudioMuxer and Transcriber
             // keep seeing a single file.
@@ -234,6 +251,7 @@ class RecordingManager {
             // below still have to fire: on quit one of them is what lets the
             // process exit.
             guard var manifest = currentManifest else {
+                postProcessor.setRecordingActive(false, dir: baseDir)
                 log("[RecordingManager] Session never came up — nothing to post-process")
                 drainStopCompletions(completion)
                 return
@@ -244,6 +262,8 @@ class RecordingManager {
             // later can never be aligned again.
             manifest.micStartSeconds = micStart
             manifest.systemStartSeconds = sysStart
+            manifest.systemAudioTimeline = systemTimeline
+            manifest.stages.systemTimelineRestored = systemTimeline?.gaps.isEmpty ?? true
             manifest.videoStartSeconds = vidStart
             manifest.segments = micSegments.map(CallSessionManifest.record)
             manifest.recordingFinished = true
@@ -256,6 +276,7 @@ class RecordingManager {
             // needing ffmpeg is left to the pipeline, which resumes at the next
             // launch if this process does not live long enough to finish it.
             if micSegments.isEmpty {
+                manifest.micFile = nil
                 manifest.stages.micPublished = true      // the mic never produced audio
             } else if let micURL = micURL,
                       MicStitcher.shared.canPublishByRename(segments: micSegments, outputURL: micURL) {
@@ -264,6 +285,8 @@ class RecordingManager {
             }
             manifest.save(in: baseDir)
             currentManifest = nil
+            // Publish finalized timings before recovered jobs can read them.
+            postProcessor.setRecordingActive(false, dir: baseDir)
 
             drainStopCompletions(completion)
 

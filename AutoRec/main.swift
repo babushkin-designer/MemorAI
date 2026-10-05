@@ -1,5 +1,21 @@
 import Cocoa
 
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--audio-probe" {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Task { @MainActor in
+        do {
+            try await AudioCaptureProbe.run(in: URL(fileURLWithPath: CommandLine.arguments[2]))
+            exit(0)
+        } catch {
+            fputs("Audio probe failed: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+    }
+    app.run()
+    exit(1)
+}
+
 // Prevent multiple instances
 let runningApps = NSWorkspace.shared.runningApplications.filter {
     $0.bundleIdentifier == "com.local.memorai"

@@ -12,7 +12,7 @@ personal fork; do not push to any remote.
 - `swift build` — the primary gate (repo root). ~10 s warm.
 - `tools/lint.sh` — strict SwiftLint gate. The repository has no lint baseline;
   every configured warning fails the command.
-- `swift test` — 169 tests; must stay offline and must never touch the real
+- `swift test` — 196 tests; must stay offline and must never touch the real
   data dir (fixture dirs only). ffmpeg/AEC-dependent tests skip themselves
   where those are not installed.
 - `bash bundle.sh` — builds MemorAI.app and codesigns it (stable identity so
@@ -83,7 +83,7 @@ MicRecorder writes `_mic.part<N>` segments (a new one on every engine restart �
 device switches change the format, and a file's format is fixed when opened).
 
 Post-processing (PostProcessor, off a `_session.json` manifest written at
-start): publish `_mic.m4a` from the segments → Deepgram call transcription
+start): restore system PTS gaps offline → publish `_mic.m4a` from the segments → Deepgram call transcription
 (two source tracks uploaded concurrently; local Whisper fallback) → optional
 EchoCanceller → AudioMuxer. Each stage is idempotent and recorded as it completes, so quitting
 or crashing mid-pipeline only costs the stage in flight; the next launch calls
@@ -128,9 +128,16 @@ Invariants worth not breaking:
   without a mic track.
 - Track alignment comes from host-clock starts (`AudioMuxer.computeOffsets`),
   used by both the muxer and the speaker-labeled transcript.
-- MicRecorder's tap runs on the audio thread: shared state is `_`-prefixed and
-  guarded by `UnfairLock`, and the tap NEVER tears anything down — it posts one
-  main-queue event and the main queue owns the engine.
+- MicRecorder's tap only copies PCM into MicCapturePipeline's bounded owned
+  buffers and updates metrics under short locks. Encoding, IO, RMS and logging
+  belong to the serial writer; no sink IO under a producer-shared lock. Recovery
+  posts one generation-checked main-queue event; only main owns the engine.
+- Pause/capture gaps are preserved exactly once in host-time metadata. System
+  m4a AVAssetWriter compacts PTS holes, so restore these offline BEFORE
+  transcription/AEC/mux. Keep the immutable `.compact.m4a` source until all
+  stages complete durably; cancellation can roll back a stage after publication.
+- Mic failure must retain system/screen capture. Dictation launch must share
+  its call gate lock, and completed speech must survive interruptions on disk.
 - Echo cancellation is OFFLINE only. Apple voice processing reconfigures the
   shared input device for every app on the machine and degraded a real meeting;
   the live path was removed on purpose, do not bring it back.

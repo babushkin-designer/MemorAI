@@ -89,7 +89,8 @@ final class PostProcessor {
 
     /// Work files that a killed run can leave behind. Each is rebuilt from
     /// scratch by the stage that owns it, so a leftover is always garbage.
-    static let temporarySuffixes = [".stitching.m4a", ".muxing.mp4"]
+    static let temporarySuffixes = [".stitching.m4a", ".muxing.mp4", ".timeline.m4a",
+                                    ".timeline.filter.txt", ".compact.tmp", ".compact.m4a"]
 
     /// Runs the pipeline for one session. Returns immediately.
     func enqueue(_ manifest: CallSessionManifest, in dir: URL,
@@ -121,12 +122,12 @@ final class PostProcessor {
             guard !pending.isEmpty else { return }
             log("[PostProcessor] \(pending.count) unfinished session(s) from a previous run — resuming")
             let readable = pending.filter { url in
-                guard CallSessionManifest.load(url) != nil else {
+                guard let manifest = CallSessionManifest.load(url) else {
                     log("[PostProcessor] ⚠️ Unreadable manifest \(url.lastPathComponent) — removing")
                     try? FileManager.default.removeItem(at: url)
                     return false
                 }
-                return true
+                return !self.scheduledRetries.contains(manifest.tag)
             }
             self.processBatch(readable, in: dir)
         }
@@ -162,10 +163,12 @@ final class PostProcessor {
     /// holding the rest of a recovered backlog behind hours of enhancement.
     private func processBatch(_ urls: [URL], in dir: URL) {
         let transcriptSteps: [(String, (inout CallSessionManifest, URL) -> Void)] = [
+            ("system timeline", mediaService.restoreSystemTimeline),
             ("stitch", mediaService.publishMicTrack),
             ("transcribe", transcribe),
         ]
         let mediaSteps: [(String, (inout CallSessionManifest, URL) -> Void)] = [
+            ("system timeline", mediaService.restoreSystemTimeline),
             ("aec", mediaService.cancelEcho),
             ("mux", mediaService.muxVideo),
         ]
@@ -186,6 +189,15 @@ final class PostProcessor {
         guard !isRecordingActive else {
             log("[PostProcessor] Recording in progress — \(input.tag) waits (manifest stays on disk)")
             return
+        }
+        if input.stages.systemTimelineRestored == false {
+            // Only the transcript pass retries restoration. Never spend a
+            // second attempt immediately in the playback pass of the same batch.
+            if case .media = phase { return }
+            if input.attempts >= CallSessionManifest.maxAttempts {
+                log("[PostProcessor] System timeline for \(input.tag) needs manual retry — sources and manifest retained")
+                return
+            }
         }
 
         var manifest = input
@@ -212,6 +224,16 @@ final class PostProcessor {
                 break
             }
             completed = manifest.stages
+            if manifest.stages.systemTimelineRestored == false {
+                // Downstream timestamps are invalid until restoration succeeds.
+                if isRecordingActive { interrupted = true; break }
+                if manifest.save(in: dir), attempt < CallSessionManifest.maxAttempts {
+                    scheduleRetry(for: manifest, in: dir)
+                }
+                AudioGlitchMonitor.shared.setStage(nil)
+                log("[PostProcessor] System timeline failed for \(manifest.tag) (attempt \(attempt)); sources retained")
+                return
+            }
             if isRecordingActive {
                 // A network-only Deepgram upload already in flight is allowed
                 // to finish. Preserve it, then stop before local heavy work.
@@ -237,11 +259,14 @@ final class PostProcessor {
         }
 
         if manifest.stages.allDone {
+            guard manifest.save(in: dir) else { return }
+            mediaService.discardCompactSystemTrack(manifest, in: dir)
             retryableTranscriptionTags.remove(manifest.tag)
             manifest.remove(in: dir)
             log("[PostProcessor] Session \(manifest.tag) complete")
         } else if attempt >= CallSessionManifest.maxAttempts {
             retryableTranscriptionTags.remove(manifest.tag)
+            mediaService.discardCompactSystemTrack(manifest, in: dir)
             manifest.remove(in: dir)
             Transcriber.discardPartials(tag: manifest.tag, in: dir)
             log("[PostProcessor] ⚠️ Session \(manifest.tag) still unfinished after \(attempt) attempts — giving up (stages: \(manifest.stages))")

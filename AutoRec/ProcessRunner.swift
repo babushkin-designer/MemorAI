@@ -157,11 +157,27 @@ enum ProcessRunner {
         let entry = Entry(process)
         do {
             if role == .postProcessing {
+                // Recheck and launch while holding the same gate used by
+                // suspension. Otherwise call-start can cancel an unstarted
+                // registry entry, then this thread launches it after the call.
                 registryLock.lock()
+                if suspended {
+                    sawCancellation = true
+                    registryLock.unlock()
+                    outPipe.fileHandleForReading.readabilityHandler = nil
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+                    return Result(exitCode: Result.cancelledCode, stdout: "", stderr: "recording gate closed")
+                }
                 registry[ObjectIdentifier(entry)] = entry
+                do { try process.run() } catch {
+                    registry[ObjectIdentifier(entry)] = nil
+                    registryLock.unlock()
+                    throw error
+                }
                 registryLock.unlock()
+            } else {
+                try process.run()
             }
-            try process.run()
             if role == .postProcessing {
                 setpriority(PRIO_PROCESS, id_t(process.processIdentifier), 10)
             }

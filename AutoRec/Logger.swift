@@ -18,7 +18,17 @@ func log(_ message: String) {
     let line = "\(ts) \(message)\n"
     logQueue.async {
         guard let data = line.data(using: .utf8) else { return }
-        let path = SettingsManager.shared.outputPath + "/memorai.log"
+        // XCTest exercises error paths too; never append test diagnostics to
+        // the user's live recording directory or consult its defaults.
+        let path: String
+        if ProcessInfo.processInfo.processName == "xctest" {
+            path = FileManager.default.temporaryDirectory
+                .appendingPathComponent("memorai-tests-\(ProcessInfo.processInfo.processIdentifier).log").path
+        } else if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--audio-probe" {
+            path = URL(fileURLWithPath: CommandLine.arguments[2]).appendingPathComponent("capture.log").path
+        } else {
+            path = SettingsManager.shared.outputPath + "/memorai.log"
+        }
         if cachedPath != path {
             try? cachedHandle?.close()
             cachedHandle = nil

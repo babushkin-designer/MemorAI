@@ -115,28 +115,29 @@ enum CallLLM {
     }
 
     /// Generate `call_<tag>_title.txt` for a session. No-op when a title
-    /// already exists or the transcript is missing. Safe to call repeatedly.
+    /// already exists or the transcript is missing. Failures remain typed so
+    /// the batch can stop on quota exhaustion. Safe to call repeatedly.
     @discardableResult
-    static func generateTitle(for session: CallSession) -> Bool {
+    static func generateTitle(for session: CallSession) -> Result<Bool, LLMError> {
         guard session.title == nil,
               let transcriptURL = session.transcriptURL,
               let transcript = try? String(contentsOf: transcriptURL, encoding: .utf8),
               transcript.trimmingCharacters(in: .whitespacesAndNewlines).count >= 40 else {
-            return false
+            return .success(false)
         }
         let prompt = titlePrompt(transcript: transcript)
         switch LLMClient.shared.complete(system: prompt.system, user: prompt.user) {
         case .failure(let error):
             log("[CallLLM] ⚠️ Title generation failed for \(session.tag): \(error.localizedDescription)")
-            return false
+            return .failure(error)
         case .success(let raw):
             let title = sanitizeTitle(raw)
-            guard !title.isEmpty else { return false }
+            guard !title.isEmpty else { return .success(false) }
             let url = transcriptURL.deletingLastPathComponent()
                 .appendingPathComponent("call_\(session.tag)_title.txt")
-            try? (title + "\n").write(to: url, atomically: true, encoding: .utf8)
+            do { try (title + "\n").write(to: url, atomically: true, encoding: .utf8) } catch { return .failure(.badResponse) }
             log("[CallLLM] 🏷 \(session.tag): \(title)")
-            return true
+            return .success(true)
         }
     }
 

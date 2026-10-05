@@ -20,6 +20,23 @@ final class CallMediaService {
             .map { $0.1 }
     }
 
+    func restoreSystemTimeline(_ manifest: inout CallSessionManifest, in dir: URL) {
+        guard manifest.stages.systemTimelineRestored == false else { return }
+        guard let timeline = manifest.systemAudioTimeline,
+              let url = manifest.resolve(manifest.systemFile, in: dir) else { return }
+        if timeline.restore(at: url) {
+            manifest.stages.systemTimelineRestored = true
+            manifest.save(in: dir)
+            // Keep the immutable source until the whole session completes:
+            // cancellation can roll this stage back after publication.
+        }
+    }
+
+    func discardCompactSystemTrack(_ manifest: CallSessionManifest, in dir: URL) {
+        guard let url = manifest.resolve(manifest.systemFile, in: dir) else { return }
+        try? FileManager.default.removeItem(at: url.deletingPathExtension().appendingPathExtension("compact.m4a"))
+    }
+
     func publishMicTrack(_ manifest: inout CallSessionManifest, in dir: URL) {
         guard !manifest.stages.micPublished else { return }
         adoptOrphanParts(&manifest, in: dir)
@@ -29,14 +46,6 @@ final class CallMediaService {
         }
         let segments = manifest.micSegments(in: dir)
         guard !segments.isEmpty else {
-            manifest.stages.micPublished = true
-            return
-        }
-
-        // A process can die after the atomic rename and before the manifest
-        // save. A canonical track with no remaining parts is already success.
-        let partsLeft = segments.contains { FileManager.default.fileExists(atPath: $0.url.path) }
-        if !partsLeft, FileManager.default.fileExists(atPath: micURL.path) {
             manifest.stages.micPublished = true
             return
         }

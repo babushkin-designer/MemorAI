@@ -56,7 +56,15 @@ class DictationManager {
     private var recordingURL: URL?
     private var maxDurationTimer: Timer?
 
-    private var serverProcess: Process?
+    private let callGate = CallWorkGate()
+    private let pendingStore: DictationPendingStore
+
+    init(pendingStore: DictationPendingStore? = nil) {
+        self.pendingStore = pendingStore ?? DictationPendingStore(directory:
+            URL(fileURLWithPath: SettingsManager.shared.outputPath).appendingPathComponent("dictation-pending"))
+    }
+    // Only workQueue touches deferred work and the server language/model.
+    private var pendingDictations: [(URL, String)] = []
     private var serverLang: String?
     private var serverModel: String?
     private var idleShutdownWork: DispatchWorkItem?
@@ -65,7 +73,7 @@ class DictationManager {
     /// the same input device plus a resident whisper model, and a call already
     /// has two recorders and a hard real-time deadline. Its fn-tap is ignored
     /// for the duration and the warm server is released.
-    private var callActive = false
+    private var workBlocked: Bool { callGate.isBlocked }
 
     private let workQueue = DispatchQueue(label: "com.local.memorai.dictation", qos: .userInitiated)
 
@@ -78,6 +86,7 @@ class DictationManager {
 
     func enable() {
         guard eventMonitors.isEmpty else { return }
+        callGate.setEnabled(true)
 
         if !AXIsProcessTrusted() {
             log("[Dictation] ⚠️ Accessibility permission missing — global fn monitoring will not receive events")
@@ -97,6 +106,15 @@ class DictationManager {
             eventMonitors.append(monitor)
         }
         log("[Dictation] fn-key monitor installed (\(eventMonitors.count) monitors)")
+        let restored = pendingStore.pending()
+        if !restored.isEmpty, state == .idle { state = .processing }
+        workQueue.async { [weak self] in
+            guard let self else { return }
+            for job in restored where !self.pendingDictations.contains(where: { $0.0 == job.0 }) {
+                self.pendingDictations.append(job)
+            }
+            self.resumePendingDictations()
+        }
     }
 
     func disable() {
@@ -135,6 +153,7 @@ class DictationManager {
 
     /// Full teardown for app quit: hotkey, recording, warm server.
     func shutdown() {
+        callGate.setEnabled(false) // Refuse warmups until explicitly enabled again.
         disable()
         stopServer()
     }
@@ -143,21 +162,20 @@ class DictationManager {
 
     /// Called when a call recording starts and stops.
     func setCallActive(_ active: Bool) {
-        guard callActive != active else { return }
-        callActive = active
-        guard active else {
+        guard callGate.isActive != active else { return }
+        callGate.setActive(active) // Refuse queued warmups BEFORE flushing the mic.
+        if active {
+            if state == .listening { stopListeningAndTranscribe() }
+            stopServer()
+            log("[Dictation] Disabled while a call records (pending speech deferred)")
+        } else {
             log("[Dictation] Enabled again (call ended)")
-            return
+            workQueue.async { [weak self] in self?.resumePendingDictations() }
         }
-        // Mid-dictation when the call starts: finish it rather than throw the
-        // text away — the user is holding it in their head, not on disk.
-        if state == .listening { stopListeningAndTranscribe() }
-        stopServer()
-        log("[Dictation] Disabled while a call records (whisper-server released)")
     }
 
     func toggle() {
-        if callActive, state == .idle {
+        if workBlocked, state == .idle {
             log("[Dictation] Ignored — a call is being recorded")
             NSSound(named: "Basso")?.play()
             return
@@ -170,9 +188,9 @@ class DictationManager {
     }
 
     private func startListening() {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("memorai_dictation_\(UUID().uuidString).m4a")
+        let url: URL
         do {
+            url = try pendingStore.recordingURL()
             try startEngine(outputURL: url)
         } catch {
             log("[Dictation] ❌ Mic start failed: \(error.localizedDescription)")
@@ -203,20 +221,48 @@ class DictationManager {
         NSSound(named: "Pop")?.play()
 
         let lang = language
+        let retainedURL: URL
+        do { retainedURL = try pendingStore.persist(url, language: lang) } catch {
+            retainedURL = url
+            log("[Dictation] Could not persist pending speech; original retained: \(error.localizedDescription)")
+        }
         workQueue.async { [weak self] in
-            guard let self = self else { return }
-            defer {
-                try? FileManager.default.removeItem(at: url)
-                self.state = .idle
-            }
-            guard let text = self.transcribe(m4aURL: url, lang: lang), !text.isEmpty else {
-                log("[Dictation] No speech recognized")
-                DispatchQueue.main.async { NSSound(named: "Basso")?.play() }
+            guard let self else { return }
+            self.pendingDictations.append((retainedURL, lang))
+            self.resumePendingDictations()
+        }
+    }
+
+    /// Keep the source audio until recognition succeeds or fails independently
+    /// of a call. A recording gate interruption must not discard spoken words.
+    private func resumePendingDictations() {
+        while !workBlocked, let (url, lang) = pendingDictations.first {
+            switch transcribe(m4aURL: url, lang: lang) {
+            case .done(let text):
+                pendingDictations.removeFirst()
+                history.add(text)
+                pendingStore.remove(url)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, !self.workBlocked else { return }
+                    self.paste(text)
+                }
+            case .paused:
+                // A call can end before the cancelled child returns. Ensure
+                // pending work is retried even without another gate transition.
+                if !workBlocked {
+                    workQueue.asyncAfter(deadline: .now() + 1) { [weak self] in self?.resumePendingDictations() }
+                }
                 return
+            case .failed:
+                guard !workBlocked else { return }
+                pendingDictations.removeFirst()
+                log("[Dictation] Recognition failed — source retained for retry")
             }
-            log("[Dictation] Recognized \(text.count) chars")
-            self.history.add(text)
-            DispatchQueue.main.async { self.paste(text) }
+        }
+        if pendingDictations.isEmpty {
+            DispatchQueue.main.async { [weak self] in
+                if self?.state == .processing { self?.state = .idle }
+            }
         }
     }
 
@@ -267,7 +313,8 @@ class DictationManager {
 
     // MARK: - Transcription
 
-    private func transcribe(m4aURL: URL, lang: String) -> String? {
+    private func transcribe(m4aURL: URL, lang: String) -> Transcriber.StageOutcome<String> {
+        guard !workBlocked else { return .paused }
         let wavURL = m4aURL.deletingPathExtension().appendingPathExtension("wav")
         defer { try? FileManager.default.removeItem(at: wavURL) }
 
@@ -275,9 +322,10 @@ class DictationManager {
             "-y", "-nostats", "-loglevel", "error", "-i", m4aURL.path,
             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavURL.path,
         ], timeout: 60)
+        guard !convert.wasCancelled, !workBlocked else { return .paused }
         guard convert.exitCode == 0 else {
             log("[Dictation] ❌ ffmpeg convert failed (exit \(convert.exitCode)): \(convert.stderr.suffix(300))")
-            return nil
+            return .failed
         }
 
         var text: String?
@@ -285,11 +333,19 @@ class DictationManager {
             text = serverInference(wavURL: wavURL)
             scheduleIdleShutdown()
         }
+        if let text, !text.isEmpty { return Self.recognitionOutcome(text) }
+        if workBlocked { return .paused }
         if text == nil {
             log("[Dictation] Server path unavailable — falling back to whisper-cli")
-            text = cliInference(wavURL: wavURL, lang: lang)
+            return cliInference(wavURL: wavURL, lang: lang)
         }
-        return text.map(Self.cleanDictationText)
+        return Self.recognitionOutcome(text)
+    }
+
+    private static func recognitionOutcome(_ text: String?) -> Transcriber.StageOutcome<String> {
+        guard let text else { return .failed }
+        let cleaned = cleanDictationText(text)
+        return cleaned.isEmpty ? .failed : .done(cleaned)
     }
 
     /// Flatten whisper output into paste-ready text: strip non-speech
@@ -314,13 +370,14 @@ class DictationManager {
     /// Start (or reuse) a warm whisper-server with the current model/language.
     /// Returns true when the server answers on its port.
     private func ensureServer(lang: String) -> Bool {
+        guard !workBlocked else { return false }
         let modelFile = Transcriber.shared.resolvedModelPath
         guard FileManager.default.fileExists(atPath: modelFile) else { return false }
 
-        if let p = serverProcess, p.isRunning, serverLang == lang, serverModel == modelFile {
+        if let p = callGate.server, p.isRunning, serverLang == lang, serverModel == modelFile {
             return pingServer(timeout: 2)
         }
-        stopServer()
+        callGate.stopServer()
 
         guard let serverPath = resolvedServerPath else {
             log("[Dictation] whisper-server not found")
@@ -339,21 +396,21 @@ class DictationManager {
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
         do {
-            try proc.run()
+            guard try callGate.launch({ try proc.run(); return proc }) != nil else { return false }
         } catch {
             log("[Dictation] ❌ whisper-server launch failed: \(error.localizedDescription)")
             return false
         }
-        serverProcess = proc
         serverLang = lang
         serverModel = modelFile
         log("[Dictation] whisper-server starting (model: \((modelFile as NSString).lastPathComponent))…")
 
         // Model load takes a few seconds; poll until the port answers.
         for _ in 0..<120 {
+            if workBlocked || callGate.server !== proc { return false }
             if !proc.isRunning {
                 log("[Dictation] ❌ whisper-server exited during startup")
-                serverProcess = nil
+                callGate.stopServer()
                 return false
             }
             if pingServer(timeout: 1) {
@@ -363,31 +420,28 @@ class DictationManager {
             usleep(500_000)
         }
         log("[Dictation] ❌ whisper-server did not become ready in 60s")
-        stopServer()
+        callGate.stopServer()
         return false
     }
 
     private func stopServer() {
+        // Main-queue lifecycle, process ownership synchronized with launch.
         idleShutdownWork?.cancel()
         idleShutdownWork = nil
-        if let p = serverProcess, p.isRunning {
-            p.terminate()
-            log("[Dictation] whisper-server stopped")
-        }
-        serverProcess = nil
-        serverLang = nil
-        serverModel = nil
+        callGate.stopServer()
     }
 
     private func scheduleIdleShutdown() {
-        idleShutdownWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self = self, self.state == .idle else { return }
-            log("[Dictation] Idle for \(Int(self.serverIdleShutdown / 60)) min — releasing whisper-server")
-            self.stopServer()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.workBlocked else { return }
+            self.idleShutdownWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.state == .idle else { return }
+                self.callGate.stopServer()
+            }
+            self.idleShutdownWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + self.serverIdleShutdown, execute: work)
         }
-        idleShutdownWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + serverIdleShutdown, execute: work)
     }
 
     /// Any HTTP response on the port means the server finished loading the model.
@@ -449,8 +503,8 @@ class DictationManager {
         return text
     }
 
-    private func cliInference(wavURL: URL, lang: String) -> String? {
-        guard let whisperExec = Transcriber.shared.resolvedWhisperPath else { return nil }
+    private func cliInference(wavURL: URL, lang: String) -> Transcriber.StageOutcome<String> {
+        guard let whisperExec = Transcriber.shared.resolvedWhisperPath else { return .failed }
         let modelFile = Transcriber.shared.resolvedModelPath
         let outBase = wavURL.deletingPathExtension()
         let txtURL = outBase.appendingPathExtension("txt")
@@ -461,11 +515,12 @@ class DictationManager {
             "-et", "2.2", "-lpt", "-0.5",
             "-otxt", "-of", outBase.path, wavURL.path,
         ], timeout: 300)
+        guard !result.wasCancelled, !workBlocked else { return .paused }
         guard result.exitCode == 0 else {
             log("[Dictation] ❌ whisper-cli failed (exit \(result.exitCode)): \(result.stderr.suffix(300))")
-            return nil
+            return .failed
         }
-        return try? String(contentsOf: txtURL, encoding: .utf8)
+        return Self.recognitionOutcome(try? String(contentsOf: txtURL, encoding: .utf8))
     }
 
     // MARK: - Paste
@@ -499,15 +554,9 @@ class DictationManager {
 
     // MARK: - Subprocess helper
 
-    /// Deliberately `.foreground`, not `.postProcessing`. These children run
-    /// the user's own dictation, including the flush that happens the moment a
-    /// call starts — a role the recording gate refuses would throw away words
-    /// they just spoke. They are seconds of audio, not a four-hour call.
-    ///
-    /// This used to be a third hand-rolled copy of the runner (the second was
-    /// in Transcriber), and it had drifted: its timeout only sent SIGTERM, so a
-    /// whisper that ignored it held the queue forever.
+    /// Dictation conversion/inference shares the recording gate. Interrupted
+    /// work keeps its source file and is retried after the call.
     private func runProcess(_ path: String, args: [String], timeout: TimeInterval) -> ProcessRunner.Result {
-        ProcessRunner.run(path, args: args, timeout: timeout, role: .foreground)
+        ProcessRunner.run(path, args: args, timeout: timeout, role: .postProcessing)
     }
 }

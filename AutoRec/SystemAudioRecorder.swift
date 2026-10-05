@@ -12,6 +12,7 @@ class SystemAudioRecorder: NSObject {
     private var audioWriter: AVAssetWriter?
     private var audioInput: AVAssetWriterInput?
     private var audioSessionStarted = false
+    private(set) var audioTimeline = SystemAudioTimeline()
     private let audioURL: URL
 
     // Video writer (optional)
@@ -29,8 +30,20 @@ class SystemAudioRecorder: NSObject {
     private var audioQueue: DispatchQueue?
     private var videoQueue: DispatchQueue?
 
-    private var isRecording = false
-    var isPaused = false
+    private let stateLock = UnfairLock()
+    private var recording = false
+    private var paused = false
+    private var isRecording: Bool {
+        get { stateLock.withLock { recording } }
+        set { stateLock.withLock { recording = newValue } }
+    }
+    var isPaused: Bool {
+        get { stateLock.withLock { paused } }
+        set {
+            stateLock.withLock { paused = newValue }
+            statsLock.withLock { _stats.audioExpectedEnd = nil }
+        }
+    }
 
     // --- Capture health counters (see CaptureStats) ---
     private let statsLock = UnfairLock()
@@ -196,7 +209,7 @@ class SystemAudioRecorder: NSObject {
     /// treat the session as having no system audio (mic-only use case).
     private func startWarmupTimer() {
         warmupTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        let timer = DispatchSource.makeTimerSource(queue: audioQueue ?? DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + warmupTimeout)
         timer.setEventHandler { [weak self] in
             guard let self = self, self.isRecording, !self.audioWarmedUp else { return }
@@ -256,7 +269,8 @@ class SystemAudioRecorder: NSObject {
     }
 
     func stop() async {
-        guard isRecording else { return }
+        // Also finalize after a delegate error has already cleared recording.
+        guard stream != nil || audioWriter != nil || videoWriter != nil else { return }
         isRecording = false
 
         warmupTimer?.cancel()
@@ -269,8 +283,10 @@ class SystemAudioRecorder: NSObject {
         }
         stream = nil
 
-        // Small delay to let in-flight buffers drain
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        // Explicit barriers, not a guessed delay: writer finalization must
+        // follow every callback which passed the recording-state guard.
+        audioQueue?.sync {}
+        videoQueue?.sync {}
 
         // Finalize audio
         if let aInput = audioInput, let aWriter = audioWriter {
@@ -320,19 +336,12 @@ extension SystemAudioRecorder: SCStreamOutput {
                 return
             }
 
-            if !audioSessionStarted {
-                let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-                audioWriter?.startSession(atSourceTime: pts)
-                audioSessionStarted = true
-                audioFirstPTSSeconds = CMTimeGetSeconds(pts)
-                if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-                   let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
-                    let format = asbd.pointee
-                    log("[SystemAudioRecorder] Audio format: \(format.mSampleRate)Hz,"
-                        + " \(format.mChannelsPerFrame)ch, \(format.mBitsPerChannel)bit")
-                }
+            beginAudioSession(sampleBuffer)
+            if input.append(sampleBuffer) {
+                recordAcceptedAudio(sampleBuffer)
+            } else {
+                statsLock.withLock { _stats.audioNotReady += 1 }
             }
-            input.append(sampleBuffer)
 
             // Warmup suppresses silence detection for the first non-silent buffer, so the
             // ~30s of digital silence SCStream emits at startup doesn't trigger auto-stop.
@@ -412,6 +421,27 @@ extension SystemAudioRecorder: SCStreamOutput {
     /// captured audio shows up as the next buffer starting later than the
     /// previous one ended. Counted before the writer-readiness check, so a gap
     /// on the capture side is never confused with our own writer falling behind.
+    private func recordAcceptedAudio(_ sampleBuffer: CMSampleBuffer) {
+        guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc), asbd.pointee.mSampleRate > 0 else { return }
+        let duration = Double(CMSampleBufferGetNumSamples(sampleBuffer)) / asbd.pointee.mSampleRate
+        audioTimeline.record(host: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)), duration: duration)
+    }
+
+    private func beginAudioSession(_ sampleBuffer: CMSampleBuffer) {
+        guard !audioSessionStarted else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        audioWriter?.startSession(atSourceTime: pts)
+        audioSessionStarted = true
+        audioFirstPTSSeconds = CMTimeGetSeconds(pts)
+        if let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc) {
+            let format = asbd.pointee
+            log("[SystemAudioRecorder] Audio format: \(format.mSampleRate)Hz,"
+                + " \(format.mChannelsPerFrame)ch, \(format.mBitsPerChannel)bit")
+        }
+    }
+
     private func recordAudioTiming(_ sampleBuffer: CMSampleBuffer) {
         let start = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         let duration = CMTimeGetSeconds(CMSampleBufferGetDuration(sampleBuffer))
@@ -437,27 +467,37 @@ extension SystemAudioRecorder: SCStreamOutput {
 
     /// Compute RMS of a CMSampleBuffer containing float32 audio.
     private func bufferRMS(_ sampleBuffer: CMSampleBuffer) -> Float {
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return 0 }
-        let length = CMBlockBufferGetDataLength(blockBuffer)
-        var data = Data(count: length)
-        data.withUnsafeMutableBytes { rawBuf in
-            guard let ptr = rawBuf.baseAddress else { return }
-            CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: ptr)
+        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return 0 }
+        var length = 0
+        var total = 0
+        var pointer: UnsafeMutablePointer<Int8>?
+        if CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: &length,
+                                      totalLengthOut: &total, dataPointerOut: &pointer) == noErr,
+           length == total, let pointer {
+            return Self.floatRMS(UnsafeRawPointer(pointer), byteCount: total)
         }
-        let floatCount = length / MemoryLayout<Float>.size
-        guard floatCount > 0 else { return 0 }
-        return data.withUnsafeBytes { rawBuf in
-            guard let floats = rawBuf.baseAddress?.assumingMemoryBound(to: Float.self) else { return Float(0) }
-            var sum: Float = 0
-            for i in 0..<floatCount {
-                let s = floats[i]
-                sum += s * s
-            }
-            return sqrtf(sum / Float(floatCount))
+        // A block buffer need not be contiguous. Keep the safe copy fallback.
+        let bytes = CMBlockBufferGetDataLength(block)
+        var copy = Data(count: bytes)
+        return copy.withUnsafeMutableBytes { data in
+            guard let base = data.baseAddress,
+                  CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: bytes, destination: base) == noErr else { return 0 }
+            return Self.floatRMS(base, byteCount: bytes)
         }
     }
 
-    /// Track silence duration using RMS.
+    private static func floatRMS(_ pointer: UnsafeRawPointer, byteCount: Int) -> Float {
+        let samples = byteCount / MemoryLayout<Float>.size
+        guard samples > 0 else { return 0 }
+        var sum: Float = 0
+        for i in 0..<samples {
+            // Audio block alignment is not an API guarantee.
+            let sample = pointer.loadUnaligned(fromByteOffset: i * MemoryLayout<Float>.size, as: Float.self)
+            sum += sample * sample
+        }
+        return sqrtf(sum / Float(samples))
+    }
+
     private func updateSilenceState(_ sampleBuffer: CMSampleBuffer) {
         let rms = bufferRMS(sampleBuffer)
         let now = Date()
@@ -489,9 +529,9 @@ extension SystemAudioRecorder: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("[SystemAudioRecorder] Stream stopped with error: \(error)")
         isRecording = false
-        warmupTimer?.cancel()
-        warmupTimer = nil
         DispatchQueue.main.async { [weak self] in
+            self?.warmupTimer?.cancel()
+            self?.warmupTimer = nil
             self?.onStreamError?(error)
         }
     }

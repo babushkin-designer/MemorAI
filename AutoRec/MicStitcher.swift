@@ -43,7 +43,8 @@ class MicStitcher {
     /// Silence (seconds) to insert before each segment; the first is always 0.
     /// A segment whose start or predecessor's start is unknown gets 0 — better
     /// a slightly short track than a wrong amount of padding.
-    static func gaps(for segments: [(firstHost: Double?, duration: Double)]) -> [Double] {
+    static func gaps(for segments: [(firstHost: Double?, duration: Double)],
+                     preserve: [Bool] = []) -> [Double] {
         guard !segments.isEmpty else { return [] }
         var result: [Double] = [0]
         for i in 1..<segments.count {
@@ -59,10 +60,11 @@ class MicStitcher {
                 result.append(0)
                 continue
             }
-            if gap < minGapSeconds {
+            let measured = preserve.indices.contains(i) && preserve[i]
+            if gap < (measured ? 0.00001 : minGapSeconds) {
                 result.append(0)          // overlap or jitter
             } else {
-                result.append(min(gap, maxGapSeconds))
+                result.append(measured ? gap : min(gap, maxGapSeconds))
             }
         }
         return result
@@ -90,7 +92,7 @@ class MicStitcher {
             if i > 0, gap > 0 {
                 // anullsrc is infinite; atrim cuts it to the hole's length.
                 filterParts.append(String(format:
-                    "anullsrc=r=%d:cl=%@,atrim=end=%.3f,asetpts=PTS-STARTPTS[g%d]",
+                    "anullsrc=r=%d:cl=%@,atrim=end=%.9f,asetpts=PTS-STARTPTS[g%d]",
                     rate, canonicalChannels, gap, i))
                 pads.append("[g\(i)]")
             }
@@ -140,17 +142,20 @@ class MicStitcher {
     /// file stays absent rather than holding a fraction of the call.
     @discardableResult
     func stitch(segments: [MicRecorder.Segment], outputURL: URL) -> Bool {
+        // All callers share the publication invariant, including recovery after
+        // a crash halfway through cleanup. Never rebuild an already whole track.
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            discardParts(segments, except: outputURL)
+            return true
+        }
         let usable = usableSegments(segments)
         guard !usable.isEmpty else { return false }
-        // A lone segment already sitting at the destination is the whole track.
-        guard usable.count > 1 || usable[0].url != outputURL else { return true }
 
         // The common case — one uninterrupted segment in the output format —
         // is a rename. Running it through ffmpeg would re-encode every call for
         // nothing and add a failure mode to the path that publishes the track.
         if Self.isReadyToPublish(usable, outputURL: outputURL) {
             do {
-                try? FileManager.default.removeItem(at: outputURL)
                 try FileManager.default.moveItem(at: usable[0].url, to: outputURL)
                 log("[MicStitcher] Mic track published as \(outputURL.lastPathComponent)")
                 return true
@@ -160,7 +165,8 @@ class MicStitcher {
             }
         }
 
-        let gaps = Self.gaps(for: usable.map { ($0.firstBufferHostSeconds, $0.duration) })
+        let gaps = Self.gaps(for: usable.map { ($0.firstBufferHostSeconds, $0.duration) },
+                             preserve: usable.map { $0.preservesGap })
         let tempURL = outputURL.deletingPathExtension().appendingPathExtension("stitching.m4a")
         try? FileManager.default.removeItem(at: tempURL)
 
@@ -203,10 +209,14 @@ class MicStitcher {
         }
 
         // Only now that the finished track is in place are the parts redundant.
-        for segment in usable where segment.url != outputURL {
-            try? FileManager.default.removeItem(at: segment.url)
-        }
+        discardParts(usable, except: outputURL)
         log("[MicStitcher] ✅ Mic track rejoined into \(outputURL.lastPathComponent)")
         return true
+    }
+
+    private func discardParts(_ segments: [MicRecorder.Segment], except outputURL: URL) {
+        for segment in segments where segment.url != outputURL {
+            try? FileManager.default.removeItem(at: segment.url)
+        }
     }
 }

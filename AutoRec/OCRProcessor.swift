@@ -20,15 +20,9 @@ class OCRProcessor {
         "/usr/local/bin/python3",     // Intel Homebrew
     ]
 
-    /// Guarded by `shutdownLock` rather than by `queue`, because `queue` can be
-    /// sitting inside a 30 s read and quit may not wait that long for it. An
-    /// uncontended lock costs nothing next to what it guards against.
-    private let shutdownLock = NSLock()
-    private var sidecar: Process? {
-        get { shutdownLock.withLock { _sidecar } }
-        set { shutdownLock.withLock { _sidecar = newValue } }
-    }
-    private var _sidecar: Process?
+    // Shared launch/stop gate registers a child before model readiness, so a
+    // call or quit can stop even a process still loading its model.
+    private let gate = CallWorkGate()
     private var sidecarIn: FileHandle?
     private var sidecarOut: FileHandle?
     private var outBuffer = Data()
@@ -85,7 +79,8 @@ class OCRProcessor {
 
     /// Lazily launches the sidecar and waits for its readiness line.
     private func ensureSidecar() -> (FileHandle, FileHandle)? {
-        if let stdin = sidecarIn, let stdout = sidecarOut, sidecar?.isRunning == true {
+        guard !gate.isBlocked else { return nil }
+        if let stdin = sidecarIn, let stdout = sidecarOut, gate.server?.isRunning == true {
             return (stdin, stdout)
         }
         if let after = retryAfter, Date() < after { return nil }
@@ -106,7 +101,7 @@ class OCRProcessor {
         proc.standardError = FileHandle.nullDevice
 
         do {
-            try proc.run()
+            guard try gate.launch({ try proc.run(); return proc }) != nil else { return nil }
         } catch {
             log("[OCR] sidecar launch failed: \(error) — OCR disabled")
             recordSidecarFailure()
@@ -122,12 +117,12 @@ class OCRProcessor {
               let obj = try? JSONSerialization.jsonObject(with: ready) as? [String: Any],
               obj["ready"] as? Bool == true else {
             log("[OCR] sidecar did not report ready — OCR disabled")
-            proc.terminate()
-            recordSidecarFailure()
+            gate.stopServer()
+            if !gate.isBlocked { recordSidecarFailure() }
             return nil
         }
 
-        sidecar = proc
+        guard !gate.isBlocked, gate.server === proc else { return nil }
         sidecarIn = stdin
         sidecarOut = stdout
         consecutiveFailures = 0
@@ -156,17 +151,14 @@ class OCRProcessor {
     /// for up to 30 s, and quit is not allowed to wait that long. Terminating
     /// the process out from under that read just ends it early, which is what
     /// we want anyway.
-    func shutdown() {
-        let proc = shutdownLock.withLock { () -> Process? in
-            let running = _sidecar
-            _sidecar = nil
-            return running
-        }
-        proc?.terminate()
-    }
+    func shutdown() { gate.setEnabled(false) }
+
+    func resume() { gate.setEnabled(true) }
+
+    func setCallActive(_ active: Bool) { gate.setActive(active) }
 
     private func teardownSidecar() {
-        shutdown()
+        gate.stopServer()
         sidecarIn = nil
         sidecarOut = nil
         outBuffer.removeAll()

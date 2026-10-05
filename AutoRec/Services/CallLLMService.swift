@@ -9,8 +9,20 @@ final class CallLLMService {
     private let queue = DispatchQueue(label: "com.local.memorai.llm", qos: .utility)
     private let lock = UnfairLock()
     private var _isBusy = false
+    private var quotaBlocked = false // Serial queue only; automatic requests stand down.
+    private let titleGenerator: (CallSession) -> Result<Bool, LLMError>
+    private let titleDelay: TimeInterval
+
+    init(titleDelay: TimeInterval = 12,
+         titleGenerator: @escaping (CallSession) -> Result<Bool, LLMError> = CallLLM.generateTitle) {
+        self.titleDelay = titleDelay
+        self.titleGenerator = titleGenerator
+    }
+
+    func waitUntilIdle() { queue.sync {} }
 
     var onBusyChanged: ((Bool) -> Void)?
+    var onQuotaExhausted: (() -> Void)?
     var isBusy: Bool { lock.withLock { _isBusy } }
 
     func session(tag: String, outputPath: String) -> CallSession? {
@@ -20,10 +32,11 @@ final class CallLLMService {
 
     func autoTitle(tag: String, outputPath: String) {
         queue.async {
-            guard let session = self.session(tag: tag, outputPath: outputPath),
+            guard !self.quotaBlocked,
+                  let session = self.session(tag: tag, outputPath: outputPath),
                   session.transcriptURL != nil,
                   session.title == nil else { return }
-            CallLLM.generateTitle(for: session)
+            if case .failure(.quotaExhausted) = self.titleGenerator(session) { self.reportQuotaExhausted() }
         }
     }
 
@@ -36,8 +49,16 @@ final class CallLLMService {
             var completed = 0
             for (index, session) in untitled.enumerated() {
                 // Bluesminds free tier throttles bursts aggressively.
-                if index > 0 { Thread.sleep(forTimeInterval: 12) }
-                if CallLLM.generateTitle(for: session) { completed += 1 }
+                if index > 0 { Thread.sleep(forTimeInterval: self.titleDelay) }
+                switch self.titleGenerator(session) {
+                case .success(let generated):
+                    if generated { completed += 1; self.quotaBlocked = false }
+                case .failure(.quotaExhausted):
+                    self.reportQuotaExhausted()
+                    self.endBusyJob()
+                    return
+                case .failure: break
+                }
             }
             log("[CallLLM] Title backfill: \(completed)/\(untitled.count) generated")
             self.endBusyJob()
@@ -66,6 +87,12 @@ final class CallLLMService {
         }
         if started { notifyBusyChanged(true) }
         return started
+    }
+
+    private func reportQuotaExhausted() {
+        quotaBlocked = true
+        log("[CallLLM] Quota exhausted — title batch stopped; automatic titles suspended")
+        DispatchQueue.main.async { [weak self] in self?.onQuotaExhausted?() }
     }
 
     private func endBusyJob(completion: (() -> Void)? = nil) {

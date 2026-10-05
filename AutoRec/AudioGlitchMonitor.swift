@@ -1,28 +1,12 @@
 import Foundation
 import CoreAudio
 
-/// Counts the audio dropouts the machine actually suffers while we record.
-///
-/// The symptom this exists for is crackle in the SPEAKERS during a call — a
-/// missed CoreAudio IO deadline, not something any of our recorded files can
-/// show (SCStream taps the mix before it reaches the hardware, so the system
-/// track stays clean through a dropout the user heard). The only honest signal
-/// is `kAudioDeviceProcessorOverload`, which the HAL posts to every listener on
-/// a device that missed its cycle.
-///
-/// It is a MEASUREMENT, not a fix: every event is stamped with what the app was
-/// doing at the time (recording, which post-processing stage, which subprocess),
-/// so an overload burst can be attributed to our own background load instead of
-/// guessed at.
-///
-/// STRICTLY READ-ONLY toward the devices. It attaches listeners and reads
-/// properties; it never sets one. Buffer frame size and sample rate are shared
-/// by every client on the machine, and writing them to "help" is the bug we
-/// already removed once (live voice processing).
-///
-/// THREADING. All state lives on `queue`. Property listeners are delivered
-/// there too, so a listener never touches an audio thread and never logs from
-/// one — it bumps a counter, and the periodic timer does the writing.
+/// Read-only HAL overload and route/configuration observations.
+/// A missing event does not establish clean playback: driver and cross-process
+/// notification coverage vary. Capture continuity and audible playback are
+/// separate acceptance criteria. This monitor never sets device properties.
+/// All listener state and session totals live on `queue`, including reattachment
+/// when the default device changes.
 final class AudioGlitchMonitor {
     static let shared = AudioGlitchMonitor()
 
@@ -39,6 +23,15 @@ final class AudioGlitchMonitor {
     }
 
     private var watches: [Watch] = []
+    private struct ConfigurationListener {
+        let id: AudioObjectID
+        let property: AudioObjectPropertyAddress
+        let callback: AudioObjectPropertyListenerBlock
+    }
+    private var retiredOverloads = 0
+    private var routeListeners: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+    private var configurationListeners: [ConfigurationListener] = []
+    private var totalOverloads: Int { retiredOverloads + watches.reduce(0) { $0 + $1.overloads } }
     private var running = false
     private var startedAt: Date?
     /// What the app was doing, for the event lines. Set by RecordingManager /
@@ -62,7 +55,9 @@ final class AudioGlitchMonitor {
             self.running = true
             self.startedAt = Date()
             self.context = context
+            self.retiredOverloads = 0
             self.attachAll()
+            self.attachRouteListeners()
             self.startReportTimer()
             let names = self.watches.map { "\($0.role)=\($0.name)" }.joined(separator: ", ")
             log("[AudioGlitch] Watching \(self.watches.count) device(s): \(names)")
@@ -76,7 +71,7 @@ final class AudioGlitchMonitor {
             self.running = false
             self.reportTimer?.cancel()
             self.reportTimer = nil
-            let total = self.watches.reduce(0) { $0 + $1.overloads }
+            let total = self.totalOverloads
             let elapsed = self.startedAt.map { Date().timeIntervalSince($0) } ?? 0
             let perMinute = elapsed > 0 ? Double(total) / (elapsed / 60) : 0
             let detail = self.watches
@@ -85,6 +80,7 @@ final class AudioGlitchMonitor {
                 .joined(separator: ", ")
             log(String(format: "[AudioGlitch] Session total: %d overload(s) in %.0fs (%.2f/min)%@",
                        total, elapsed, perMinute, detail.isEmpty ? "" : " — \(detail)"))
+            self.detachRouteListeners()
             self.detachAll()
             self.startedAt = nil
         }
@@ -170,9 +166,24 @@ final class AudioGlitchMonitor {
         }
         watch.listener = listener
         watches.append(watch)
+        for selector in [kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyNominalSampleRate] {
+            var property = AudioObjectPropertyAddress(mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            let callback: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.snapshot("device configuration changed")
+            }
+            if AudioObjectAddPropertyListenerBlock(id, &property, queue, callback) == noErr {
+                configurationListeners.append(ConfigurationListener(id: id, property: property, callback: callback))
+            }
+        }
     }
 
     private func detachAll() {
+        for listener in configurationListeners {
+            var address = listener.property
+            AudioObjectRemovePropertyListenerBlock(listener.id, &address, queue, listener.callback)
+        }
+        configurationListeners.removeAll()
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDeviceProcessorOverload,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -183,6 +194,31 @@ final class AudioGlitchMonitor {
             AudioObjectRemovePropertyListenerBlock(watch.id, &address, queue, listener)
         }
         watches.removeAll()
+    }
+
+    private func attachRouteListeners() {
+        for (_, selector) in Self.defaultDeviceSelectors {
+            var address = AudioObjectPropertyAddress(mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            let callback: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                guard let self, self.running else { return }
+                self.retiredOverloads += self.watches.reduce(0) { $0 + $1.overloads }
+                self.detachAll()
+                self.attachAll()
+                self.snapshot("default audio device changed")
+            }
+            if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, callback) == noErr {
+                routeListeners.append((address, callback))
+            }
+        }
+    }
+
+    private func detachRouteListeners() {
+        for (property, callback) in routeListeners {
+            var address = property
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, callback)
+        }
+        routeListeners.removeAll()
     }
 
     /// Already on `queue` — the listener block was registered against it.
@@ -207,7 +243,7 @@ final class AudioGlitchMonitor {
         var lastTotal = 0
         timer.setEventHandler { [weak self] in
             guard let self = self, self.running else { return }
-            let total = self.watches.reduce(0) { $0 + $1.overloads }
+            let total = self.totalOverloads
             defer { lastTotal = total }
             guard total > lastTotal else { return }
             log("[AudioGlitch] \(total - lastTotal) overload(s) in the last \(Int(self.reportInterval))s "

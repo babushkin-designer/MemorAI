@@ -545,7 +545,11 @@ class Transcriber {
     static let sameSpeakerMaxRunMs = 90_000
 
     static func dialogueTranscript(mic: [TranscriptSegment], system: [TranscriptSegment]) -> String {
-        var tagged = mic.map { (seg: $0, speaker: "Я") } + system.map { (seg: $0, speaker: "Собеседник") }
+        dialogueTranscript(mic.map { (seg: $0, speaker: "Я") } + system.map { (seg: $0, speaker: "Собеседник") })
+    }
+
+    static func dialogueTranscript(_ input: [(seg: TranscriptSegment, speaker: String)]) -> String {
+        var tagged = input
         tagged.sort { $0.seg.fromMs < $1.seg.fromMs }
         guard !tagged.isEmpty else { return "" }
 

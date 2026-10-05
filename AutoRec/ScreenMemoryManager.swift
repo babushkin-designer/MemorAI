@@ -39,11 +39,11 @@ class ScreenMemoryManager {
     func setCallActive(_ active: Bool) {
         guard callPaused != active else { return }
         callPaused = active
+        ocrProcessor.setCallActive(active)
         if active {
             // Dictation releases its whisper-server for a call; the OCR model
             // is the same kind of resident weight and does no work either way
             // while the loop is paused. `ensureSidecar` brings it back after.
-            ocrProcessor.shutdown()
             log("[ScreenMemory] paused (call recording, OCR sidecar released)")
         } else {
             lastSavedHash = 0  // the screen moved on while we were not looking
@@ -56,6 +56,7 @@ class ScreenMemoryManager {
         let settings = SettingsManager.shared
         let outputURL = URL(fileURLWithPath: settings.outputPath)
 
+        ocrProcessor.resume()
         isRunning = true
         lastSavedHash = 0
         keyPressCount = 0

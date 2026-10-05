@@ -286,31 +286,9 @@ final class DeepgramTranscriber {
     }
 
     static func render(_ input: [(utterance: Utterance, label: String)]) -> String {
-        let sorted = input.sorted { $0.utterance.fromMs < $1.utterance.fromMs }
-        guard let first = sorted.first else { return "" }
-        var lines: [String] = []
-        var label = first.label
-        var start = first.utterance.fromMs
-        var end = first.utterance.toMs
-        var text = first.utterance.text
-
-        for item in sorted.dropFirst() {
-            let gap = item.utterance.fromMs - end
-            let run = item.utterance.fromMs - start
-            if item.label == label,
-               gap <= Transcriber.sameSpeakerGapBreakMs,
-               run < Transcriber.sameSpeakerMaxRunMs {
-                text += " " + item.utterance.text
-                end = max(end, item.utterance.toMs)
-            } else {
-                lines.append(Transcriber.formatDialogueLine(startMs: start, speaker: label, text: text))
-                label = item.label
-                start = item.utterance.fromMs
-                end = item.utterance.toMs
-                text = item.utterance.text
-            }
-        }
-        lines.append(Transcriber.formatDialogueLine(startMs: start, speaker: label, text: text))
-        return lines.joined(separator: "\n") + "\n"
+        Transcriber.dialogueTranscript(input.map {
+            (seg: TranscriptSegment(fromMs: $0.utterance.fromMs, toMs: $0.utterance.toMs, text: $0.utterance.text),
+             speaker: $0.label)
+        })
     }
 }

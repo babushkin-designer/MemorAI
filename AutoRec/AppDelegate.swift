@@ -55,6 +55,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         requestPermissions()
         settings.ensureOutputDirectory()
         llmService.onBusyChanged = { [weak self] _ in self?.updateMenu() }
+        llmService.onQuotaExhausted = {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "LLM tokens exhausted"
+            alert.informativeText = LLMError.quotaExhausted.localizedDescription
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
         RetentionManager.shared.start()
 
         // --- Screen Memory (init before menu so clipboard history is available) ---
